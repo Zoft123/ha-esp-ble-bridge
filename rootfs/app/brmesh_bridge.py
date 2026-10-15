@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 """
-BRMesh Bridge - Comprehensive light management system
-- Dynamic discovery and registration
-- ESPHome config generation
-- BRMesh app sync
-- NSPanel UI
-- Web dashboard
+ESP BLE Bridge add-on.
+
+Keeps the list of BRMesh lights and ESP32 controllers, generates the ESPHome configuration for the
+controllers, and offers a web UI to manage them. The lights themselves are controlled by the ESP32s
+(ESPHome + fastcon) and show up in Home Assistant through the ESPHome integration; the web UI drives
+those entities through the Home Assistant API.
 """
-import asyncio
-import json
 import logging
 import os
-import sys
-from typing import Dict, List
-import paho.mqtt.client as mqtt
-from bleak import BleakScanner
-import struct
 import threading
+from typing import Dict, List, Optional, Tuple
+
+from brmesh_export import mask_key
 from effects import BRMeshEffects
-from web_ui import WebUI, app
-from esphome_generator import ESPHomeConfigGenerator
 from esphome_builder import ESPHomeBuilder
-from ble_discovery import BRMeshDiscovery
-from app_importer import BRMeshAppImporter
-from nspanel_ui import NSPanelUIGenerator
+from esphome_generator import ESPHomeConfigGenerator
+from ha_api import HomeAssistantAPI
+from state_store import StateStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,527 +26,279 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+ADDON_VERSION = '0.60.0'
+
+
 class BRMeshBridge:
     def __init__(self):
-        # Initialize lights/controllers before loading config
-        self.lights: Dict[int, dict] = {}
-        self.controllers: List[dict] = []
-        
-        self.load_config()
-        
-        # Configuration from add-on options
-        self.mesh_key = self.config.get('mesh_key', '')
-        
-        # Try to load mesh_key from secrets.yaml if not in config
-        if not self.mesh_key:
-            try:
-                from ruamel.yaml import YAML
-                secrets_path = '/config/secrets.yaml'
-                if os.path.exists(secrets_path):
-                    yaml = YAML()
-                    with open(secrets_path, 'r') as f:
-                        secrets = yaml.load(f) or {}
-                    self.mesh_key = secrets.get('mesh_key', '')
-                    if self.mesh_key:
-                        self.config['mesh_key'] = self.mesh_key
-                        logger.info(f"✅ Loaded mesh_key from secrets.yaml")
-            except Exception as e:
-                logger.warning(f"Could not load mesh_key from secrets.yaml: {e}")
-        
-        # Get MQTT credentials from environment (set by Bashio in run script)
-        self.mqtt_host = os.getenv('MQTT_HOST', 'core-mosquitto')
-        self.mqtt_port = int(os.getenv('MQTT_PORT', '1883'))
-        self.mqtt_user = os.getenv('MQTT_USER', '')
-        self.mqtt_password = os.getenv('MQTT_PASS', '')
-        
-        if self.mqtt_user:
-            logger.info(f"✅ Got MQTT credentials from Bashio: {self.mqtt_user}@{self.mqtt_host}:{self.mqtt_port}")
-        else:
-            logger.warning(f"⚠️  No MQTT credentials provided - using anonymous connection")
-        self.discovery_enabled = self.config.get('discovery_enabled', True)
-        self.mqtt_client = None
-        self.effects = None
-        self.web_ui = None
-        self.esphome_generator = None
-        self.esphome_builder = None
-        self.ble_discovery = None
-        self.app_importer = None
-        self.nspanel_ui = None
-    
-    def load_config(self):
-        """Load configured lights and controllers from options"""
-        # Set defaults
-        self.config = {
-            'mesh_key': '',
-            'use_addon_mqtt': True,
-            'mqtt_host': 'core-mosquitto',
-            'mqtt_port': 1883,
-            'mqtt_user': '',
-            'mqtt_password': '',
-            'discovery_enabled': True,
-            'generate_esphome_configs': True,
-            'use_optimized_fork': True,  # Use optimized fastcon fork with command deduplication
-            'enable_ble_discovery': True,
-            'enable_nspanel_ui': False,
-            'nspanel_entity_id': '',
-            'app_config_path': '/share/brmesh_export.json',
-            'map_enabled': True,
-            'map_latitude': 0.0,
-            'map_longitude': 0.0,
-            'map_zoom': 19,
-            'controllers': [],
-            'lights': [],
-            'scenes': [],
-            'effects': [
-                {'name': 'Rainbow', 'enabled': True},
-                {'name': 'Color Loop', 'enabled': True},
-                {'name': 'Twinkle', 'enabled': True},
-                {'name': 'Fire', 'enabled': True}
-            ]
-        }
-        
-        try:
-            with open('/data/options.json', 'r') as f:
-                loaded_config = json.load(f)
-                # Merge loaded config with defaults
-                self.config.update(loaded_config)
-                
-                # Load lights
-                for light in self.config.get('lights', []):
-                    light_id = light['light_id']
-                    self.lights[light_id] = {
-                        'name': light['name'],
-                        'color_interlock': light.get('color_interlock', True),
-                        'supports_cwww': light.get('supports_cwww', False),
-                        'state': {'state': False, 'brightness': 255, 'rgb': [255, 255, 255]},
-                        'location': light.get('location', {'x': None, 'y': None}),
-                        'signal_strength': {},
-                        'preferred_controller': light.get('preferred_controller')
-                    }
-                
-                # Load controllers
-                self.controllers = self.config.get('controllers', [])
-                
-                # Auto-detect Home Assistant location if not configured
-                if not self.config.get('map_latitude') or not self.config.get('map_longitude'):
-                    self._detect_ha_location()
-                
-                logger.info(f"Loaded {len(self.lights)} lights and {len(self.controllers)} controllers from config")
-        except Exception as e:
-            logger.error(f"Error loading config: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
-    def save_config(self):
-        """Save configuration back to file"""
-        try:
-            # Update config object with current light data
-            self.config['lights'] = []
-            for light_id, light in self.lights.items():
-                self.config['lights'].append({
-                    'light_id': light_id,
-                    'name': light['name'],
-                    'color_interlock': light.get('color_interlock', True),
-                    'supports_cwww': light.get('supports_cwww', False),
-                    'location': light.get('location', {'x': None, 'y': None}),
-                    'preferred_controller': light.get('preferred_controller')
-                })
-            
-            self.config['controllers'] = self.controllers
-            self.config['mesh_key'] = self.mesh_key
-            
-            with open('/data/options.json', 'w') as f:
-                json.dump(self.config, f, indent=2)
-            
-            logger.info("Configuration saved")
-        except Exception as e:
-            logger.error(f"Failed to save config: {e}")
-    
-    def setup_mqtt(self):
-        """Setup MQTT client"""
-        self.mqtt_client = mqtt.Client()
-        
-        if self.mqtt_user:
-            self.mqtt_client.username_pw_set(self.mqtt_user, self.mqtt_password)
-        
-        self.mqtt_client.on_connect = self.on_mqtt_connect
-        self.mqtt_client.on_message = self.on_mqtt_message
-        
-        try:
-            self.mqtt_client.connect(self.mqtt_host, self.mqtt_port, 60)
-            logger.info(f"Connected to MQTT broker at {self.mqtt_host}:{self.mqtt_port}")
-        except Exception as e:
-            logger.error(f"Failed to connect to MQTT: {e}")
-            sys.exit(1)
-    
-    def on_mqtt_connect(self, client, userdata, flags, rc):
-        """MQTT connection callback"""
-        logger.info("MQTT connected with result code " + str(rc))
-        
-        # Subscribe to ESP32 controller status topics (birth messages)
-        client.subscribe("brmesh-bridge/+/status")
-        logger.info("Subscribed to ESP32 controller status topics")
-        
-        # Subscribe to command topics for all lights
-        for light_id in self.lights:
-            topic = f"homeassistant/light/brmesh_{light_id}/set"
-            client.subscribe(topic)
-            logger.info(f"Subscribed to {topic}")
-        
-        # Publish discovery configs
-        if self.discovery_enabled:
-            self.publish_discovery()
-    
-    def on_mqtt_message(self, client, userdata, msg):
-        """MQTT message callback - handle light commands and controller status"""
-        try:
-            # Check if this is an ESP32 controller status message
-            if msg.topic.startswith("brmesh-bridge/") and msg.topic.endswith("/status"):
-                self.handle_controller_status(msg)
-                return
-            
-            # Parse topic to get light ID
-            topic_parts = msg.topic.split('/')
-            light_name = topic_parts[2]  # e.g., "brmesh_10"
-            light_id = int(light_name.split('_')[1])
-            
-            if light_id not in self.lights:
-                return
-            
-            # Parse command
-            payload = json.loads(msg.payload.decode())
-            logger.info(f"Received command for light {light_id}: {payload}")
-            
-            # Update state
-            if 'state' in payload:
-                self.lights[light_id]['state']['state'] = payload['state'] == 'ON'
-            if 'brightness' in payload:
-                self.lights[light_id]['state']['brightness'] = payload['brightness']
-            if 'color' in payload:
-                rgb = payload['color']
-                self.lights[light_id]['state']['rgb'] = [rgb['r'], rgb['g'], rgb['b']]
-            
-            # Send BLE command
-            self.send_ble_command(light_id)
-            
-            # Publish state
-            self.publish_state(light_id)
-            
-        except Exception as e:
-            logger.error(f"Error handling MQTT message: {e}")
-    
-    def handle_controller_status(self, msg):
-        """Handle ESP32 controller online/offline status"""
-        try:
-            # Extract controller name from topic: brmesh-bridge/{name}/status
-            controller_name = msg.topic.split('/')[1]
-            status = msg.payload.decode()
-            
-            logger.info(f"📡 Controller '{controller_name}' is {status}")
-            
-            # Find or create controller in list
-            controller = None
-            for c in self.controllers:
-                if c.get('name') == controller_name:
-                    controller = c
-                    break
-            
-            if not controller:
-                # Auto-register new controller
-                controller = {
-                    'name': controller_name,
-                    'id': controller_name,
-                    'status': status,
-                    'last_seen': __import__('datetime').datetime.now().isoformat()
-                }
-                self.controllers.append(controller)
-                logger.info(f"✅ Auto-registered new controller: {controller_name}")
-            else:
-                # Update existing controller status
-                controller['status'] = status
-                controller['last_seen'] = __import__('datetime').datetime.now().isoformat()
-            
-            # Save config with updated controllers
-            self.save_config()
-            
-        except Exception as e:
-            logger.error(f"Error handling controller status: {e}")
-    
-    def publish_discovery(self):
-        """Publish Home Assistant MQTT discovery configs"""
-        for light_id, light in self.lights.items():
-            unique_id = f"brmesh_{light_id}"
-            config = {
-                "name": light['name'],
-                "unique_id": unique_id,
-                "command_topic": f"homeassistant/light/{unique_id}/set",
-                "state_topic": f"homeassistant/light/{unique_id}/state",
-                "schema": "json",
-                "brightness": True,
-                "rgb": True,
-                "device": {
-                    "identifiers": [f"brmesh_bridge"],
-                    "name": "BRMesh Bridge",
-                    "manufacturer": "ESPHome",
-                    "model": "BRMesh Controller"
-                }
-            }
-            
-            if light['color_interlock']:
-                config['color_mode'] = True
-                config['supported_color_modes'] = ['rgb', 'white']
-            
-            topic = f"homeassistant/light/{unique_id}/config"
-            self.mqtt_client.publish(topic, json.dumps(config), retain=True)
-            logger.info(f"Published discovery for {light['name']} (ID {light_id})")
-    
-    def publish_state(self, light_id: int):
-        """Publish light state to MQTT"""
-        if light_id not in self.lights:
-            return
-        
-        state = self.lights[light_id]['state']
-        unique_id = f"brmesh_{light_id}"
-        
-        payload = {
-            "state": "ON" if state['state'] else "OFF",
-            "brightness": state['brightness'],
-            "color": {
-                "r": state['rgb'][0],
-                "g": state['rgb'][1],
-                "b": state['rgb'][2]
-            }
-        }
-        
-        topic = f"homeassistant/light/{unique_id}/state"
-        self.mqtt_client.publish(topic, json.dumps(payload))
-    
-    def set_light_color(self, light_id: int, rgb: tuple, brightness: int = 255, state: bool = True):
-        """Set light color directly (used by effects engine)"""
-        if light_id not in self.lights:
-            return
-        
-        self.lights[light_id]['state']['state'] = state
-        self.lights[light_id]['state']['brightness'] = brightness
-        self.lights[light_id]['state']['rgb'] = list(rgb)
-        
-        self.send_ble_command(light_id)
-        self.publish_state(light_id)
-    
-    def send_ble_command(self, light_id: int):
-        """Send BLE command to light (using same protocol as ESPHome fastcon)"""
-        if light_id not in self.lights:
-            return
-        
-        state = self.lights[light_id]['state']
-        
-        # Build BRMesh command packet
-        # Format: [CMD_TYPE, LIGHT_ID, R, G, B, W, BRIGHTNESS, ...]
-        cmd = 0x22  # Color/state command
-        r, g, b = state['rgb']
-        brightness = state['brightness']
-        power = 0x01 if state['state'] else 0x00
-        
-        # Build inner payload (12 bytes)
-        inner_payload = struct.pack('BBBBBBBBBBBB',
-            cmd, light_id,
-            r if state['state'] else 0,
-            g if state['state'] else 0,
-            b if state['state'] else 0,
-            0,  # white
-            brightness if state['state'] else 0,
-            power,
-            0, 0, 0, 0  # padding
-        )
-        
-        logger.info(f"Would send BLE command to light {light_id}: {inner_payload.hex()}")
-        # TODO: Implement actual BLE broadcast using bleak
-    
-    def get_controller_signal_map(self, controller_name: str) -> Dict:
-        """Get signal strength from controller to all lights"""
-        # This would query the ESP32 via MQTT for RSSI values
-        # For now, return mock data
-        signal_map = {}
-        for light_id in self.lights.keys():
-            signal_map[light_id] = {
-                'rssi': -60,  # Mock RSSI value
-                'quality': 'good'
-            }
-        return signal_map
-    
-    def scan_for_new_lights(self) -> List[dict]:
-        """Scan BRMesh network for new lights"""
-        # This would use ADB or BLE scanning
-        # For now, return empty list
-        return []
-    
-    async def scan_for_lights_async(self):
-        """Scan for BRMesh devices (optional discovery feature)"""
-        if not self.discovery_enabled:
-            return
-        
-        logger.info("Scanning for BRMesh devices...")
-        # TODO: Implement BLE scanning to detect lights
-        # This would listen for BRMesh advertisements and auto-discover light IDs
-    
-    async def run_async(self):
-        """Async initialization and background tasks"""
-        # Initialize BLE discovery if enabled
-        if self.config.get('enable_ble_discovery', True):
-            self.ble_discovery = BRMeshDiscovery(self)
-            logger.info("BLE discovery enabled")
-            
-            # Run initial scan if configured
-            if self.config.get('auto_discover_on_start', False):
-                logger.info("Running initial device discovery...")
-                discovered = await self.ble_discovery.auto_discover_and_register(duration=30)
-                logger.info(f"Auto-discovered {len(discovered)} new devices")
-        
-        # Initialize app importer
-        self.app_importer = BRMeshAppImporter(self)
-        
-        # Try to import from app export if path configured
-        app_config_path = self.config.get('app_config_path')
-        if app_config_path and os.path.exists(app_config_path):
-            logger.info(f"Importing configuration from {app_config_path}")
-            imported = self.app_importer.import_from_json_export(app_config_path)
-            if imported:
-                self.app_importer.apply_imported_config(imported)
-        
-        # Initialize NSPanel UI if enabled
-        if self.config.get('enable_nspanel_ui', False):
-            self.nspanel_ui = NSPanelUIGenerator(self)
-            self.nspanel_ui.initialize_nspanel_ui()
-            logger.info("NSPanel UI initialized")
-        
-        # Generate ESPHome configs if enabled
-        if self.config.get('generate_esphome_configs', True):
-            self.esphome_generator = ESPHomeConfigGenerator(self)
-            self.esphome_generator.sync_configs()
-            logger.info("ESPHome configurations generated")
-        
-        # Initialize ESPHome builder for compiling/flashing
-        self.esphome_builder = ESPHomeBuilder(self)
-        logger.info("🔨 ESPHome builder initialized")
-        
-        # Keep running and periodically refresh
-        try:
-            while True:
-                await asyncio.sleep(300)  # Every 5 minutes
-                
-                # Optionally sync device names from app
-                if self.config.get('auto_sync_names', False) and self.app_importer:
-                    self.app_importer.sync_device_names_from_app()
-                
-                # Regenerate ESPHome configs if lights changed
-                if self.esphome_generator:
-                    self.esphome_generator.sync_configs()
-                
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-    
-    def run(self):
-        """Main run loop"""
-        logger.info("=" * 80)
-        logger.info("=" * 80)
-        logger.info("🚀 BRMesh Bridge v0.50.7 - Starting Up (Bashio)")
-        logger.info("=" * 80)
-        logger.info(f"📡 Mesh Key: {self.mesh_key if self.mesh_key else '(not configured - use Web UI)'}")
-        logger.info(f"🔌 MQTT Broker: {self.mqtt_host}:{self.mqtt_port}")
-        logger.info(f"👤 MQTT User: {self.mqtt_user if self.mqtt_user else '(anonymous)'}")
-        logger.info("=" * 80)
-        
-        self.setup_mqtt()
-        self.mqtt_client.loop_start()
-        
-        # Initialize effects engine
+        self.store = StateStore()
+        self.ha = HomeAssistantAPI()
+        self.lights: Dict[int, dict] = {l['light_id']: l for l in self.store.data['lights']}
         self.effects = BRMeshEffects(self)
-        logger.info("✨ Effects engine initialized")
-        
-        # Initialize web UI
-        self.web_ui = WebUI(self)
-        
-        # Start web server in separate thread
-        web_thread = threading.Thread(
-            target=self.web_ui.run,
-            kwargs={'host': '0.0.0.0', 'port': 8099}
-        )
-        web_thread.daemon = True
-        web_thread.start()
-        
-        logger.info("🌐 Web UI available at http://localhost:8099")
-        logger.info("=" * 80)
-        logger.info("✅ BRMesh Bridge Ready!")
-        logger.info(f"  💡 {len(self.lights)} lights configured")
-        logger.info(f"  🎮 {len(self.controllers)} controllers configured")
-        logger.info(f"  📶 BLE Discovery: {'Enabled' if self.config.get('enable_ble_discovery') else 'Disabled'}")
-        logger.info(f"  ⚙️  ESPHome Configs: {'Enabled' if self.config.get('generate_esphome_configs') else 'Disabled'}")
-        logger.info(f"  � Optimized Fork: {'Enabled' if self.config.get('use_optimized_fork') else 'Disabled'}")
-        logger.info(f"  �📱 NSPanel UI: {'Enabled' if self.config.get('enable_nspanel_ui') else 'Disabled'}")
-        logger.info("=" * 80)
-        logger.info("📋 Copy logs from the line above (80 = characters) for troubleshooting")
-        logger.info("=" * 80)
-        
-        # Run async tasks
-        try:
-            asyncio.run(self.run_async())
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
-    
-    def _detect_ha_location(self):
-        """Auto-detect Home Assistant's configured location"""
-        try:
-            # Try to read from Home Assistant API
-            supervisor_token = os.getenv('SUPERVISOR_TOKEN')
-            if not supervisor_token:
-                logger.debug("No supervisor token available for location detection")
-                return
-            
-            import requests
-            headers = {
-                'Authorization': f'Bearer {supervisor_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # Get Home Assistant config
-            response = requests.get(
-                'http://supervisor/core/api/config',
-                headers=headers,
-                timeout=5
-            )
-            
-            if response.status_code == 200:
-                ha_config = response.json()
-                latitude = ha_config.get('latitude')
-                longitude = ha_config.get('longitude')
-                
-                if latitude and longitude:
-                    self.config['latitude'] = latitude
-                    self.config['longitude'] = longitude
-                    logger.info(f"✅ Auto-detected Home Assistant location: {latitude}, {longitude}")
-                    
-                    # Save to options.json
-                    try:
-                        options_path = '/data/options.json'
-                        with open(options_path, 'r') as f:
-                            options = json.load(f)
-                        options['latitude'] = latitude
-                        options['longitude'] = longitude
-                        with open(options_path, 'w') as f:
-                            json.dump(options, f, indent=2)
-                        logger.info("📍 Saved auto-detected location to configuration")
-                    except Exception as e:
-                        logger.warning(f"Could not save location to config: {e}")
-                else:
-                    logger.info("No location configured in Home Assistant")
+        self.esphome_generator = ESPHomeConfigGenerator(self)
+        self.esphome_builder = ESPHomeBuilder(self)
+        self.nspanel_ui = None
+        # Last state requested through the web UI, used when HA has no entity yet.
+        self._requested: Dict[int, dict] = {}
+
+    # --- state -------------------------------------------------------------
+
+    @property
+    def settings(self) -> Dict:
+        return self.store.data['settings']
+
+    @property
+    def controllers(self) -> List[dict]:
+        return self.store.data['controllers']
+
+    @controllers.setter
+    def controllers(self, value: List[dict]):
+        self.store.data['controllers'] = value
+
+    @property
+    def mesh_key(self) -> str:
+        return self.store.data.get('mesh_key', '')
+
+    @mesh_key.setter
+    def mesh_key(self, value: str):
+        self.store.data['mesh_key'] = (value or '').lower()
+
+    @property
+    def config(self) -> Dict:
+        """Flat view used by the web UI."""
+        data = dict(self.settings)
+        data.update({
+            'mesh_key': self.mesh_key,
+            'controllers': self.controllers,
+            'lights': list(self.lights.values()),
+            'scenes': self.store.data.get('scenes', []),
+            'groups': self.store.data.get('groups', []),
+            'ignored_devices': self.store.data.get('ignored_devices', []),
+            'map_latitude': self.settings.get('latitude', 0),
+            'map_longitude': self.settings.get('longitude', 0),
+            'map_zoom': self.settings.get('zoom', 19),
+        })
+        return data
+
+    def save_config(self):
+        self.store.data['lights'] = [self.lights[k] for k in sorted(self.lights)]
+        self.store.save()
+
+    def lights_changed(self):
+        """Persist and regenerate the controller YAMLs after the light list changed."""
+        self.save_config()
+        if self.settings.get('generate_esphome_configs', True) and self.controllers:
+            self.esphome_generator.ensure_secrets()
+            self.esphome_generator.generate_all_configs(force=True)
+
+    # --- import --------------------------------------------------------------
+
+    def apply_import(self, parsed: Dict, replace: bool = False, update_names: bool = True,
+                     update_mesh_key: bool = True) -> Dict:
+        """Apply the result of brmesh_export.parse_export()."""
+        added, updated = [], []
+        if replace:
+            self.lights.clear()
+        for item in parsed.get('lights', []):
+            light_id = item['light_id']
+            existing = self.lights.get(light_id)
+            if existing is None:
+                self.lights[light_id] = {
+                    'light_id': light_id,
+                    'name': item['name'],
+                    'supports_cwww': item['supports_cwww'],
+                    'color_interlock': True,
+                    'kind': item.get('kind'),
+                    'type_code': item.get('type_code'),
+                    'did': item.get('did'),
+                    'firmware': item.get('firmware'),
+                    'location': {'x': None, 'y': None},
+                }
+                added.append(light_id)
             else:
-                logger.debug(f"Could not fetch HA config: HTTP {response.status_code}")
+                changed = False
+                for key in ('kind', 'type_code', 'did', 'firmware', 'supports_cwww'):
+                    if item.get(key) is not None and existing.get(key) != item[key]:
+                        existing[key] = item[key]
+                        changed = True
+                if update_names and item.get('name') and existing.get('name') != item['name']:
+                    existing['name'] = item['name']
+                    changed = True
+                if changed:
+                    updated.append(light_id)
+
+        key_changed = False
+        if update_mesh_key and parsed.get('mesh_key') and parsed['mesh_key'] != self.mesh_key:
+            self.mesh_key = parsed['mesh_key']
+            key_changed = True
+        if parsed.get('groups'):
+            self.store.data['groups'] = parsed['groups']
+
+        self.lights_changed()
+        if key_changed:
+            self.esphome_generator.ensure_secrets()
+        logger.info(f"Imported {len(added)} new and {len(updated)} updated lights"
+                    f"{', mesh key ' + mask_key(self.mesh_key) if key_changed else ''}")
+        return {'added': added, 'updated': updated, 'mesh_key_changed': key_changed,
+                'total_lights': len(self.lights)}
+
+    # --- light control (through the ESPHome entities in Home Assistant) ------
+
+    def controller_names(self) -> List[str]:
+        return [c['name'] for c in self.controllers if c.get('name')]
+
+    def light_entity(self, light_id: int) -> Optional[str]:
+        """The Home Assistant entity of a light, on the first controller that has it."""
+        if light_id not in self.lights:
+            return None
+        for controller in self.controllers:
+            for light, name in self.esphome_generator.controller_lights(controller):
+                if light['light_id'] == light_id:
+                    entity = self.ha.find_light_entity(name, [controller['name']])
+                    if entity:
+                        return entity
+                    break
+        return None
+
+    def all_lights_entity(self) -> Optional[str]:
+        from esphome_generator import ALL_LIGHTS_NAME
+        return self.ha.find_light_entity(ALL_LIGHTS_NAME, self.controller_names())
+
+    def light_state(self, light_id: int) -> Dict:
+        entity = self.light_entity(light_id)
+        state = self.ha.state_of(entity) if entity else None
+        if state is None:
+            req = self._requested.get(light_id, {})
+            return {'state': req.get('state', False), 'brightness': req.get('brightness', 255),
+                    'rgb': req.get('rgb', [255, 255, 255]), 'entity_id': entity, 'available': False}
+        attrs = state.get('attributes', {})
+        return {
+            'state': state.get('state') == 'on',
+            'brightness': attrs.get('brightness') or 0,
+            'rgb': list(attrs.get('rgb_color') or [255, 255, 255]),
+            'entity_id': entity,
+            'available': state.get('state') not in ('unavailable', 'unknown'),
+        }
+
+    def set_lights(self, light_ids: List[int], rgb: Optional[Tuple[int, int, int]] = None,
+                   brightness: Optional[int] = None, state: bool = True) -> bool:
+        """Set one or more lights through Home Assistant. Same values -> one service call."""
+        entities = []
+        for light_id in light_ids:
+            self._requested[light_id] = {'state': state, 'brightness': brightness or 255,
+                                         'rgb': list(rgb) if rgb else [255, 255, 255]}
+            entity = self.light_entity(light_id)
+            if entity:
+                entities.append(entity)
+            else:
+                logger.warning(f"No Home Assistant entity found for light {light_id}; is the controller flashed and added to HA?")
+        if not entities:
+            return False
+        # Every configured light selected: use the broadcast entity, one BLE packet for all lamps.
+        # The broadcast carries the RGBCW device type; the app uses it for group power on every lamp type,
+        # but colors were only verified on RGBCW lamps, so mixed setups get colors per light.
+        same_kind = len({l.get('kind') for l in self.lights.values()}) == 1
+        if len(entities) == len(self.lights) > 1 and (rgb is None or not state or same_kind):
+            all_entity = self.all_lights_entity()
+            if all_entity:
+                entities = [all_entity]
+        if not state:
+            return self.ha.call_service('light', 'turn_off', {'entity_id': entities})
+        data = {'entity_id': entities}
+        if rgb is not None:
+            data['rgb_color'] = [int(c) for c in rgb]
+        if brightness is not None:
+            data['brightness'] = max(1, min(255, int(brightness)))
+        return self.ha.call_service('light', 'turn_on', data)
+
+    def set_light_color(self, light_id: int, rgb: tuple, brightness: int = 255, state: bool = True) -> bool:
+        return self.set_lights([light_id], rgb, brightness, state)
+
+    # --- controllers -----------------------------------------------------------
+
+    def controller_status(self, controller: Dict) -> Dict:
+        """Online state and IP address of a controller, from its ESPHome entities in HA."""
+        status = {'online': None, 'ip': controller.get('ip_address'), 'esphome_version': None, 'in_home_assistant': False}
+        for s in self.ha.controller_entities(controller['name']):
+            entity_id = s['entity_id']
+            status['in_home_assistant'] = True
+            if entity_id.startswith('binary_sensor.') and entity_id.endswith('_status'):
+                status['online'] = s.get('state') == 'on'
+            elif entity_id.endswith('_ip_address') and s.get('state') not in ('unknown', 'unavailable'):
+                status['ip'] = s.get('state')
+            elif entity_id.endswith('_esphome_version') and s.get('state') not in ('unknown', 'unavailable'):
+                status['esphome_version'] = s.get('state')
+        return status
+
+    # --- startup -----------------------------------------------------------
+
+    def _detect_ha_location(self):
+        if self.settings.get('latitude') and self.settings.get('longitude'):
+            return
+        config = self.ha.config()
+        if config and config.get('latitude') and config.get('longitude'):
+            self.settings['latitude'] = config['latitude']
+            self.settings['longitude'] = config['longitude']
+            self.store.save()
+            logger.info("Using Home Assistant's location for the map")
+
+    def _cleanup_old_mqtt_entities(self):
+        """Older versions published MQTT lights that never controlled anything. Remove them once."""
+        if self.store.data.get('mqtt_cleanup_done') or not os.getenv('MQTT_HOST'):
+            return
+        try:
+            import paho.mqtt.client as mqtt
+            ids = set(self.lights) | {int(l.get('light_id', 0)) for l in self.store.options.get('lights', []) if isinstance(l, dict)}
+            client = mqtt.Client()
+            if os.getenv('MQTT_USER'):
+                client.username_pw_set(os.getenv('MQTT_USER'), os.getenv('MQTT_PASS', ''))
+            client.connect(os.getenv('MQTT_HOST'), int(os.getenv('MQTT_PORT', '1883')), 30)
+            client.loop_start()
+            for light_id in ids:
+                if light_id:
+                    client.publish(f"homeassistant/light/brmesh_{light_id}/config", b'', retain=True).wait_for_publish(5)
+            client.loop_stop()
+            client.disconnect()
+            self.store.data['mqtt_cleanup_done'] = True
+            self.store.save()
+            logger.info(f"Removed {len(ids)} stale MQTT light entities from older versions")
         except Exception as e:
-            logger.debug(f"Could not auto-detect Home Assistant location: {e}")
+            logger.debug(f"MQTT cleanup skipped: {e}")
+
+    def _background_startup(self):
+        try:
+            self.store.migrate_secrets()
+            self.esphome_generator.install_components()
+            self.esphome_generator.sync_configs()
+        except Exception as e:
+            logger.error(f"ESPHome setup failed: {e}", exc_info=True)
+        self._detect_ha_location()
+        self._cleanup_old_mqtt_entities()
+        if self.settings.get('enable_nspanel_ui'):
+            try:
+                from nspanel_ui import NSPanelUIGenerator
+                self.nspanel_ui = NSPanelUIGenerator(self)
+                self.nspanel_ui.initialize_nspanel_ui()
+            except Exception as e:
+                logger.warning(f"NSPanel UI not started: {e}")
+
+    def run(self):
+        logger.info("=" * 70)
+        logger.info(f"ESP BLE Bridge v{ADDON_VERSION}")
+        logger.info(f"  Mesh key:    {mask_key(self.mesh_key) or '(not set - import your BRMesh export in the Web UI)'}")
+        logger.info(f"  Lights:      {len(self.lights)}")
+        logger.info(f"  Controllers: {len(self.controllers)}")
+        logger.info("=" * 70)
+
+        # Store a copy of the state the first time we run with the new storage.
+        if not os.path.exists(self.store.path):
+            self.save_config()
+
+        threading.Thread(target=self._background_startup, daemon=True).start()
+
+        from web_ui import WebUI
+        WebUI(self).run(host='0.0.0.0', port=8099)
 
 
 if __name__ == '__main__':
-    bridge = BRMeshBridge()
-    bridge.run()
+    BRMeshBridge().run()

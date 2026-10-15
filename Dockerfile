@@ -1,80 +1,38 @@
-ARG BUILD_FROM=ghcr.io/hassio-addons/base:16.3.2
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
 FROM ${BUILD_FROM}
 
-# Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install system requirements
-RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    bluez \
-    bluez-deprecated \
-    gcc \
-    g++ \
-    musl-dev \
-    linux-headers \
-    git \
-    openssh-client \
-    ca-certificates \
-    make \
-    python3-dev
+# Debian (glibc), not Alpine: the ESP32 toolchains PlatformIO downloads are glibc binaries and do not
+# run on musl, so firmware could not be compiled inside an Alpine-based add-on.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-dev \
+        build-essential git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Configure git for better compatibility
-RUN git config --global http.postBuffer 524288000 && \
-    git config --global http.lowSpeedLimit 0 && \
-    git config --global http.lowSpeedTime 999999
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
-# Download esphome-fastcon component to bundle with addon
-RUN wget -O /tmp/fastcon.zip https://github.com/scross01/esphome-fastcon/archive/refs/heads/main.zip && \
-    unzip /tmp/fastcon.zip -d /tmp && \
-    mkdir -p /app/external_components && \
-    mv /tmp/esphome-fastcon-main/components/fastcon /app/external_components/ && \
-    rm -rf /tmp/fastcon.zip /tmp/esphome-fastcon-main
+# ESPHome is pinned to the version the bundled components were compiled with.
+RUN python3 -m venv /opt/venv \
+    && pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+        "esphome==2025.10.3" \
+        "flask>=3.0.0,<4.0.0" \
+        "waitress>=3.0.0,<4.0.0" \
+        "ruamel.yaml>=0.17.0,<1.0.0" \
+        "requests>=2.31,<3" \
+        "cryptography"
 
-# Install Python packages
-# Install ESPHome first to lock in its dependency versions (including paho-mqtt 1.6.1)
-RUN pip3 install --break-system-packages --no-cache-dir \
-    "esphome>=2024.11.0" \
-    "platformio>=6.1.0"
-
-# Install all PlatformIO Python dependencies that it would normally install in penv
-RUN pip3 install --break-system-packages --no-cache-dir \
-    "bottle>=0.12,<0.13" \
-    "certifi" \
-    "click>=8,<9" \
-    "colorama" \
-    "pyelftools>=0.27,<1" \
-    "pyserial>=3.5,<4" \
-    "requests>=2.4.0,<3" \
-    "semantic-version>=2.10,<3" \
-    "tabulate>=0.8.3,<1" \
-    "marshmallow>=3.20,<4" \
-    "zeroconf>=0.131,<1" \
-    "aiofiles>=22.1,<24" \
-    "wsproto>=1.2,<2" \
-    "starlette>=0.35,<1" \
-    "uvicorn>=0.27,<1"
-
-# Install remaining packages (compatible with ESPHome's dependencies)
-RUN pip3 install --break-system-packages --no-cache-dir \
-    "bleak>=0.22.0,<1.0.0" \
-    "flask>=3.0.0,<4.0.0" \
-    "flask-cors>=5.0.0,<6.0.0" \
-    "waitress>=3.0.0,<4.0.0" \
-    "pillow>=10.0.0,<12.0.0" \
-    "numpy>=2.0.0,<3.0.0" \
-    "ruamel.yaml>=0.17.0,<1.0.0"
-
-# Pre-configure PlatformIO to use system Python and avoid creating venv
+# PlatformIO keeps its toolchains in /config so they survive add-on updates.
 ENV PLATFORMIO_CORE_DIR=/config/.platformio
-ENV PLATFORMIO_GLOBALLIB_DIR=/config/.platformio/lib
 ENV PIO_INSTALL_DEVPLATFORM_SILENT=yes
-# Disable PlatformIO's virtual environment creation entirely
-ENV PLATFORMIO_PENV_DISABLE=1
 
 # Copy addon files
 COPY rootfs /
+# FastCon ESPHome components; copied to /config/esphome/esp_ble_bridge_components on start
+COPY esphome_components /app/esphome_components
 
 # Make service scripts executable
 RUN chmod a+x /etc/services.d/brmesh-bridge/run /etc/services.d/brmesh-bridge/finish

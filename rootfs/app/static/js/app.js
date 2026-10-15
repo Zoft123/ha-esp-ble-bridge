@@ -27,7 +27,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         document.getElementById('settings-tab').classList.add('active');
         loadSettings();
         loadWiFiNetworks();
-        showNotification('⚠️ Please configure your mesh key in Settings to get started', 'warning');
+        showNotification('⚠️ Import your BRMesh app export (📱 Import from BRMesh App) or enter the mesh key in Settings to get started', 'warning');
     }
     
     await loadLights();
@@ -37,8 +37,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     initMap();
     
     // Setup event listeners
-    document.getElementById('import-app-btn').addEventListener('click', importFromAppHeader);
-    document.getElementById('scan-btn').addEventListener('click', scanForLights);
+    document.getElementById('import-app-btn').addEventListener('click', openImportModal);
+    setupImportModal();
     document.getElementById('refresh-btn').addEventListener('click', refreshAll);
     document.getElementById('save-layout-btn').addEventListener('click', saveLayout);
     document.getElementById('create-scene-btn').addEventListener('click', createScene);
@@ -59,8 +59,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
     
-    // Auto-refresh every 5 seconds
-    setInterval(refreshAll, 5000);
+    // Light states are cheap to refresh; controllers change rarely. Skip while the page is hidden.
+    setInterval(() => { if (!document.hidden) loadLights(); }, 5000);
+    setInterval(() => { if (!document.hidden) loadControllers(); }, 30000);
 });
 
 // Generate random mesh key (8 hex characters)
@@ -246,9 +247,6 @@ async function loadControllers() {
         renderControllers();
         updateMapMarkers();
         initLogViewer(); // Update log controller dropdown
-        
-        // Auto-check firmware version when controllers tab loads
-        checkFirmwareUpdate();
     } catch (error) {
         console.error('Failed to load controllers:', error);
     }
@@ -289,9 +287,10 @@ function renderLights() {
         
         card.innerHTML = `
             <div class="light-header">
-                <span class="light-name">${light.name}</span>
+                <span class="light-name">${escapeHtml(light.name)}</span>
                 <span class="light-status ${light.state.state ? 'on' : ''}"></span>
             </div>
+            <div class="light-meta">ID ${light.id}${light.kind ? ' · ' + light.kind.toUpperCase() : ''}${light.on_controller === false ? ' · <span class="warn" title="Assign it to a controller (Controllers tab → 💡 Lights)">not on any controller</span>' : (light.state.entity_id ? '' : ' · <span class="warn" title="Install the firmware on a controller and add it to Home Assistant (ESPHome integration)">not in Home Assistant yet</span>')}</div>
             <div class="light-controls">
                 <button class="btn btn-primary" onclick="toggleLight(${light.id})">
                     ${light.state.state ? '⚡ Off' : '💡 On'}
@@ -303,11 +302,8 @@ function renderLights() {
             <div class="color-preview" style="background-color: ${colorHex};" 
                  onclick="pickColor(${light.id})"></div>
             <div class="light-actions">
-                <button class="btn btn-danger btn-sm" onclick="unpairLight(${light.id}, '${light.name}')" title="Remove from system">
+                <button class="btn btn-danger btn-sm" onclick="unpairLight(${light.id}, ${JSON.stringify(light.name).replace(/"/g, '&quot;')})" title="Remove from system">
                     🗑️ Remove
-                </button>
-                <button class="btn btn-warning btn-sm" onclick="factoryResetLight(${light.id}, '${light.name}')" title="Factory reset light">
-                    🔄 Reset
                 </button>
             </div>
         `;
@@ -345,7 +341,7 @@ async function toggleLight(lightId) {
     if (!light) return;
     
     try {
-        await fetch(`api/lights/${lightId}`, {
+        const response = await fetch(`api/lights/${lightId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -354,8 +350,11 @@ async function toggleLight(lightId) {
                 rgb: light.state.rgb || [255, 255, 255]
             })
         });
-        
-        await loadLights();
+        if (!response.ok) {
+            const result = await response.json();
+            showNotification(result.error || 'Could not switch the light', 'error');
+        }
+        setTimeout(loadLights, 700);
     } catch (error) {
         console.error('Failed to toggle light:', error);
     }
@@ -634,51 +633,47 @@ async function saveScene() {
 function renderControllers() {
     const grid = document.getElementById('controllers-grid');
     grid.innerHTML = '';
-    
+
     controllers.forEach(controller => {
         const card = document.createElement('div');
         card.className = 'controller-card';
-        
         const controllerName = controller.name.toLowerCase().replace(/ /g, '-');
-        
-        // Check if firmware is built (async, will update badge when complete)
-        const builtBadge = '<span id="built-' + controller.id + '">⏳ Checking...</span>';
-        checkFirmwareBuild(controller.id, controllerName);
-        
-        // Check online status (async, will update badge when complete)
-        const onlineBadge = '<span id="online-' + controller.id + '">⏳ Checking...</span>';
-        checkControllerOnline(controller.id, controller.ip);
-        
-        // Determine config status
-        const hasConfig = controller.esphome_path ? '✅ Config' : '❌ No Config';
-        
+        const job = controller.job;
+        let jobBadge = '';
+        if (job && job.running) {
+            jobBadge = `⏳ ${job.action === 'compile' ? 'Building' : 'Installing'} (${job.elapsed}s)`;
+            pollFirmwareJob(controllerName);
+        } else if (job) {
+            jobBadge = job.success ? `✅ Last ${job.action.replace('_', ' + ')} OK` : `❌ Last ${job.action.replace('_', ' + ')} failed`;
+        }
+        const online = controller.online ? '🟢 Online' : (controller.in_home_assistant ? '🔴 Offline' : '⚪ Not in Home Assistant yet');
+
         card.innerHTML = `
             <div class="controller-status">
-                <strong>${controller.name}</strong>
+                <strong>${escapeHtml(controller.name)}</strong>
                 <div style="margin-top: 5px; font-size: 0.85em;">
-                    <span style="margin-right: 10px;">${hasConfig}</span>
-                    <span style="margin-right: 10px;">${onlineBadge}</span>
-                    <span style="margin-right: 10px;">${builtBadge}</span>
+                    <span style="margin-right: 10px;">${controller.config_status === 'configured' ? '✅ Config' : '❌ No Config'}</span>
+                    <span style="margin-right: 10px;">${online}</span>
+                    <span id="job-${controllerName}">${jobBadge}</span>
                 </div>
             </div>
             <div class="controller-info">
-                <div id="ip-${controller.id}">IP: <span id="ip-value-${controller.id}">${controller.ip || 'Detecting...'}</span></div>
-                <div>MAC: ${controller.mac || 'N/A'}</div>
-                ${controller.esphome_path ? `<div>📄 ${controller.esphome_path}</div>` : ''}
+                <div>IP: ${controller.ip || 'unknown'}${controller.board ? ' · ' + escapeHtml(controller.board) : ''}</div>
+                <div>Lights: ${controller.light_count}${controller.all_lights ? ' (all)' : ' (selected)'}</div>
+                ${controller.warning ? `<div class="warn">⚠️ ${escapeHtml(controller.warning)}</div>` : ''}
+                ${controller.esphome_path ? `<div>📄 ${escapeHtml(controller.esphome_path)}</div>` : ''}
             </div>
             <div class="controller-actions">
-                <button class="btn btn-primary btn-sm" id="visit-${controller.id}" onclick="visitController('${controllerName}')" title="Visit device web interface" style="display:none;">🌐 Visit</button>
-                <button class="btn btn-secondary btn-sm" onclick="window.open('/5c53de3b_esphome/ingress', '_blank')" title="Edit in ESPHome dashboard">✏️ Edit</button>
-                <button class="btn btn-secondary btn-sm" onclick="viewLogs('${controllerName}')" title="View live logs">📋 Logs</button>
+                <button class="btn btn-success btn-sm" onclick="installFirmware('${controllerName}', this)" title="Build and install over Wi-Fi (or USB)">⚡ Install</button>
+                <button class="btn btn-primary btn-sm" onclick="buildFirmware('${controllerName}', this)" title="Only build the firmware">🔨 Build</button>
+                <button class="btn btn-secondary btn-sm" onclick="editControllerLights(${controller.id})" title="Choose which lights this controller handles">💡 Lights</button>
+                <button class="btn btn-secondary btn-sm" onclick="viewLogs('${controllerName}')" title="Build output">📋 Output</button>
                 <button class="btn btn-secondary btn-sm" onclick="regenerateYAML('${controllerName}')" title="Regenerate ESPHome YAML">🔄 Regenerate</button>
-                <button class="btn btn-danger btn-sm" onclick="resetController('${controllerName}')" title="Reset this controller">🗑️ Delete</button>
+                <button class="btn btn-secondary btn-sm" onclick="downloadESPHomeConfig('${controllerName}')" title="Download YAML">💾 YAML</button>
+                <button class="btn btn-danger btn-sm" onclick="resetController('${controllerName}')" title="Remove this controller">🗑️ Delete</button>
             </div>
         `;
-        
         grid.appendChild(card);
-        
-        // Check ESPHome status for this controller
-        checkESPHomeStatus(controller.id, controllerName);
     });
 }
 
@@ -925,6 +920,17 @@ async function createController() {
                 <input type="text" id="controller-name" placeholder="Leave blank to auto-generate (esp-ble-bridge, esp-ble-bridge-1, etc.)" />
                 <small>Auto-generated if not specified</small>
             </div>
+
+            <div class="form-group">
+                <label for="controller-board">ESP32 board:</label>
+                <select id="controller-board">
+                    <option value="esp32dev">ESP32 (most dev boards, WROOM/WROVER)</option>
+                    <option value="esp32-s3-devkitc-1">ESP32-S3</option>
+                    <option value="esp32-c3-devkitm-1">ESP32-C3</option>
+                    <option value="esp32-c6-devkitc-1">ESP32-C6</option>
+                </select>
+                <small>The ESP32-S2 (no Bluetooth) and ESP32-H2 (no Wi-Fi) cannot be used.</small>
+            </div>
             
             <div class="info-box">
                 <strong>What happens next:</strong>
@@ -1108,7 +1114,7 @@ async function saveController(buttonElement) {
         if (response.ok) {
             showNotification('Controller added successfully!', 'success');
             // Remove all modals to prevent duplicates
-            document.querySelectorAll('.modal').forEach(m => m.remove());
+            document.querySelectorAll('.modal:not(#import-modal):not(#color-picker-modal)').forEach(m => m.remove());
             await loadControllers();
         } else {
             const error = await response.json();
@@ -1159,8 +1165,10 @@ async function generateESPHomeController(buttonElement) {
         wifiPassword = null;
     }
     
+    const boardSelect = document.getElementById('controller-board');
     const controllerData = {
         name: name || null,  // Auto-generate if empty
+        board: boardSelect ? boardSelect.value : null,
         wifi_ssid: wifiSsid,
         wifi_password: wifiPassword,
         network_id: networkId,
@@ -1187,7 +1195,7 @@ async function generateESPHomeController(buttonElement) {
             const result = await response.json();
             showNotification(`✅ Controller "${result.name}" created and config generated!`, 'success');
             // Remove all modals to prevent duplicates
-            document.querySelectorAll('.modal').forEach(m => m.remove());
+            document.querySelectorAll('.modal:not(#import-modal):not(#color-picker-modal)').forEach(m => m.remove());
             await loadControllers();
             
             // Show build instructions
@@ -1195,13 +1203,10 @@ async function generateESPHomeController(buttonElement) {
                 const instructions = `
 ✅ Config generated: ${result.esphome_path}
 
-🔧 Next: Open ESPHome Dashboard to build & flash:
-   Settings → Add-ons → ESPHome → Open Web UI
-   
-Your controller "${result.name}" will appear in the dashboard.
-Click INSTALL to build and flash firmware via USB or OTA.
-
-💡 ESPHome handles compilation, flashing, and OTA updates automatically!
+🔧 Next: click ⚡ Install on the controller card.
+   The first install on a new ESP32 must be over USB (plug it into the Home Assistant machine),
+   later updates go over Wi-Fi. You can also install it from the ESPHome dashboard.
+   Then add the device in Settings → Devices & Services → ESPHome.
                 `.trim();
                 
                 showNotification(instructions, 'success', 15000);
@@ -1538,40 +1543,20 @@ async function loadSettings() {
     try {
         const response = await fetch('api/settings');
         const settings = await response.json();
-        
-        // Core settings
         document.getElementById('mesh-key').value = settings.mesh_key || '';
-        
-        // MQTT settings
-        document.getElementById('use-addon-mqtt').checked = settings.use_addon_mqtt !== false;
-        toggleMQTTSection();
-        if (!settings.use_addon_mqtt) {
-            document.getElementById('mqtt-host').value = settings.mqtt_host || '';
-            document.getElementById('mqtt-port').value = settings.mqtt_port || 1883;
-            document.getElementById('mqtt-user').value = settings.mqtt_user || '';
-            document.getElementById('mqtt-password').value = settings.mqtt_password || '';
-        }
-        
-        // Map settings
         document.getElementById('map-enabled').checked = settings.map_enabled !== false;
         document.getElementById('map-latitude').value = settings.latitude || 0;
         document.getElementById('map-longitude').value = settings.longitude || 0;
         document.getElementById('map-zoom').value = settings.zoom || 18;
         updateZoomDisplay();
-        
-        // Feature toggles
-        document.getElementById('discovery-enabled').checked = settings.discovery_enabled !== false;
         document.getElementById('generate-esphome').checked = settings.generate_esphome !== false;
-        document.getElementById('enable-ble').checked = settings.enable_ble !== false;
+        document.getElementById('include-all-lights').checked = settings.include_all_lights_entity !== false;
+        document.getElementById('enable-web-server').checked = !!settings.enable_web_server;
+        document.getElementById('adv-duration').value = settings.adv_duration || 40;
+        document.getElementById('adv-repeats').value = settings.adv_repeats || 3;
         document.getElementById('enable-nspanel').checked = settings.enable_nspanel || false;
         toggleNSPanelSettings();
-        if (settings.enable_nspanel) {
-            document.getElementById('nspanel-entity').value = settings.nspanel_entity_id || '';
-        }
-        
-        // Import/export
-        document.getElementById('app-config-path').value = settings.app_config_path || '/share/brmesh_export.json';
-        
+        document.getElementById('nspanel-entity').value = settings.nspanel_entity_id || '';
     } catch (error) {
         console.error('Failed to load settings:', error);
         showNotification('Failed to load settings', 'error');
@@ -1581,36 +1566,30 @@ async function loadSettings() {
 async function saveSettings() {
     try {
         const settings = {
-            mesh_key: document.getElementById('mesh-key').value,
-            use_addon_mqtt: document.getElementById('use-addon-mqtt').checked,
-            mqtt_host: document.getElementById('mqtt-host').value,
-            mqtt_port: parseInt(document.getElementById('mqtt-port').value),
-            mqtt_user: document.getElementById('mqtt-user').value,
-            mqtt_password: document.getElementById('mqtt-password').value,
+            mesh_key: document.getElementById('mesh-key').value.trim(),
             map_enabled: document.getElementById('map-enabled').checked,
             latitude: parseFloat(document.getElementById('map-latitude').value),
             longitude: parseFloat(document.getElementById('map-longitude').value),
             zoom: parseInt(document.getElementById('map-zoom').value),
-            discovery_enabled: document.getElementById('discovery-enabled').checked,
             generate_esphome: document.getElementById('generate-esphome').checked,
-            enable_ble: document.getElementById('enable-ble').checked,
+            include_all_lights_entity: document.getElementById('include-all-lights').checked,
+            enable_web_server: document.getElementById('enable-web-server').checked,
+            adv_duration: parseInt(document.getElementById('adv-duration').value),
+            adv_repeats: parseInt(document.getElementById('adv-repeats').value),
             enable_nspanel: document.getElementById('enable-nspanel').checked,
-            nspanel_entity_id: document.getElementById('nspanel-entity').value,
-            app_config_path: document.getElementById('app-config-path').value
+            nspanel_entity_id: document.getElementById('nspanel-entity').value
         };
-        
         const response = await fetch('api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(settings)
         });
-        
+        const result = await response.json();
         if (response.ok) {
-            showNotification('Settings saved successfully! Restarting add-on...', 'success');
-            // Restart add-on to apply changes
-            setTimeout(() => location.reload(), 3000);
+            showNotification(result.message || 'Settings saved', 'success');
+            await loadConfig();
         } else {
-            throw new Error('Failed to save settings');
+            showNotification(result.error || 'Failed to save settings', 'error');
         }
     } catch (error) {
         console.error('Failed to save settings:', error);
@@ -1829,57 +1808,121 @@ async function resetSettings() {
     }
 }
 
-async function importFromApp() {
+function importFromApp() { openImportModal(); }
+function importFromAppHeader() { openImportModal(); }
+
+// --- Import of the BRMesh app export ---
+let importPayload = null;  // {file} or {text} last previewed
+
+function setupImportModal() {
+    const drop = document.getElementById('import-drop');
+    const input = document.getElementById('import-file');
+    if (!drop || !input) return;
+    input.addEventListener('change', () => { if (input.files[0]) previewImport(input.files[0]); });
+    ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+    ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+    drop.addEventListener('drop', e => { if (e.dataTransfer.files[0]) previewImport(e.dataTransfer.files[0]); });
+}
+
+function openImportModal() {
+    importPayload = null;
+    importMesh = null;
+    document.getElementById('import-file').value = '';
+    document.getElementById('import-text').value = '';
+    document.getElementById('import-preview').style.display = 'none';
+    document.getElementById('import-error').style.display = 'none';
+    document.getElementById('import-modal').style.display = 'block';
+}
+
+function closeImportModal() {
+    document.getElementById('import-modal').style.display = 'none';
+}
+
+let importMesh = null;
+
+async function sendImport(apply) {
+    const params = new URLSearchParams({
+        apply: apply ? '1' : '0',
+        mesh: importMesh || '',
+        replace: document.getElementById('import-replace').checked ? '1' : '0',
+        update_names: document.getElementById('import-names').checked ? '1' : '0'
+    });
+    let options;
+    if (importPayload.file) {
+        const form = new FormData();
+        form.append('file', importPayload.file);
+        options = { method: 'POST', body: form };
+    } else {
+        options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: importPayload.text }) };
+    }
+    const response = await fetch(`api/import/upload?${params}`, options);
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'Import failed');
+    return result;
+}
+
+async function previewImport(file = null) {
+    const errorBox = document.getElementById('import-error');
+    errorBox.style.display = 'none';
+    if (file) {
+        importPayload = { file };
+        importMesh = null;
+    } else if (file === false) {
+        // re-preview with another mesh selected
+    } else {
+        const text = document.getElementById('import-text').value.trim();
+        if (!text) return;
+        importPayload = { text };
+    }
     try {
-        const response = await fetch('api/settings/import-app', { method: 'POST' });
-        const result = await response.json();
-        
-        if (response.ok) {
-            showNotification(`Imported ${result.lights_imported || 0} lights from BRMesh app`, 'success');
-            loadSettings();
-            loadLights();
-        } else {
-            throw new Error(result.error || 'Import failed');
+        const { preview } = await sendImport(false);
+        const newCount = preview.lights.filter(l => !l.exists).length;
+        let summary = `<p><strong>${preview.lights.length}</strong> lights (${newCount} new)`;
+        summary += preview.mesh_key_found ? `, mesh key <code>${preview.mesh_key_masked}</code>` : ', no mesh key in this file';
+        summary += '.</p>';
+        if (preview.meshes && preview.meshes.length > 1) {
+            summary += '<p>This export has more than one mesh (each has its own key). Import: ' +
+                preview.meshes.map(m => `<label style="margin-right:12px;"><input type="radio" name="import-mesh" value="${m.id}" ${m.id === preview.mesh_id ? 'checked' : ''} onchange="importMesh=this.value; previewImport(false)"> ${escapeHtml(m.label)} (${m.lights})</label>`).join('') + '</p>';
         }
+        if (preview.mesh_key_differs) {
+            summary += '<p class="warn">⚠️ The mesh key differs from the current one, so the current lights belong to another mesh. "Replace" is selected; reinstall the controllers afterwards.</p>';
+        }
+        document.getElementById('import-replace').checked = !!preview.mesh_key_differs;
+        if (preview.skipped && preview.skipped.length) {
+            summary += `<details><summary class="warn">${preview.skipped.length} device(s) will not be imported</summary><ul>` +
+                preview.skipped.map(d => `<li>${d.light_id ?? '-'} · ${escapeHtml(d.name || '')}: ${escapeHtml(d.reason)}</li>`).join('') + '</ul></details>';
+        }
+        document.getElementById('import-summary').innerHTML = summary;
+        document.getElementById('import-table').innerHTML = '<tr><th>ID</th><th>Name</th><th>Type</th><th></th></tr>' +
+            preview.lights.map(l => `<tr><td>${l.light_id}</td><td>${escapeHtml(l.name)}</td><td>${escapeHtml(l.type_label || '')}</td><td>${l.exists ? 'existing' : 'new'}</td></tr>`).join('');
+        document.getElementById('import-preview').style.display = 'block';
     } catch (error) {
-        console.error('Failed to import from app:', error);
-        showNotification('Failed to import from app: ' + error.message, 'error');
+        errorBox.textContent = '❌ ' + error.message;
+        errorBox.style.display = 'block';
+        document.getElementById('import-preview').style.display = 'none';
     }
 }
 
-// Header button version with instructions
-async function importFromAppHeader() {
-    const instructions = 'This will import lights and mesh key from your BRMesh app export.\n\n' +
-                        '1. Open BRMesh app on your phone\n' +
-                        '2. Export configuration to a file\n' +
-                        '3. Copy the file to Home Assistant at: /share/brmesh_export.json\n' +
-                        '4. Click OK to import\n\n' +
-                        'Continue?';
-    
-    if (!confirm(instructions)) return;
-    
+async function applyImport() {
+    if (!importPayload) return;
+    const btn = document.getElementById('import-apply-btn');
+    btn.disabled = true;
     try {
-        showNotification('Importing from BRMesh app...', 'info');
-        const response = await fetch('api/settings/import-app', { method: 'POST' });
-        const result = await response.json();
-        
-        if (response.ok) {
-            const message = `✅ Import successful!\n\n` +
-                          `Lights: ${result.lights_imported || 0}\n` +
-                          `Mesh Key: ${result.mesh_key ? '✓ Updated' : '⚠ Not found'}\n\n` +
-                          `The add-on will now reload with your settings.`;
-            showNotification(message, 'success');
-            
-            // Reload after a delay
-            setTimeout(() => {
-                location.reload();
-            }, 3000);
-        } else {
-            throw new Error(result.error || 'Import failed');
-        }
+        const { result, needs_install } = await sendImport(true);
+        closeImportModal();
+        let message = `✅ Imported: ${result.added.length} new, ${result.updated.length} updated, ${result.total_lights} lights in total.`;
+        if (needs_install) message += ' Install the firmware on your controllers (Controllers tab) to apply it.';
+        else message += ' Next: add an ESP32 controller in the Controllers tab.';
+        showNotification(message, 'success');
+        await loadConfig();
+        await loadLights();
+        await loadControllers();
     } catch (error) {
-        console.error('Failed to import from app:', error);
-        showNotification('❌ Import failed: ' + error.message + '\n\nMake sure the export file is at /share/brmesh_export.json', 'error');
+        const errorBox = document.getElementById('import-error');
+        errorBox.textContent = '❌ ' + error.message;
+        errorBox.style.display = 'block';
+    } finally {
+        btn.disabled = false;
     }
 }
 
@@ -1971,148 +2014,123 @@ async function downloadESPHomeConfig(controllerName) {
     }
 }
 
-async function buildFirmware(controllerName, eventOrButton = null) {
-    // Handle both event-based (button click) and programmatic calls
-    const buildBtn = eventOrButton?.target || eventOrButton;
-    const originalText = buildBtn?.textContent;
-    
-    try {
-        if (buildBtn) {
-            buildBtn.disabled = true;
-            buildBtn.textContent = '🔨 Building...';
-        }
-        showNotification(`Building firmware for ${controllerName}... This may take 5-10 minutes.`, 'info');
-        
-        const response = await fetch(`api/esphome/build/${controllerName}`, {
-            method: 'POST'
+async function editControllerLights(controllerId) {
+    const controller = controllers.find(c => c.id === controllerId);
+    if (!controller) return;
+    const selected = new Set(controller.light_ids || lights.map(l => l.id));
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.display = 'block';
+    modal.innerHTML = `
+        <div class="modal-content import-modal-content">
+            <h2>💡 Lights on ${escapeHtml(controller.name)}</h2>
+            <p>Every controller can reach every light through the mesh. With several controllers, give each one
+               the lights near it (each light then appears once in Home Assistant), or keep "all lights" for
+               the best coverage.</p>
+            <label><input type="checkbox" id="assign-all" ${controller.light_ids ? '' : 'checked'}> All lights, including ones imported later</label>
+            <div class="import-table-wrap" id="assign-list" style="margin-top: 10px;">
+                ${lights.map(l => `<label style="display:block;"><input type="checkbox" class="assign-light" value="${l.id}" ${selected.has(l.id) ? 'checked' : ''}> ${l.id} · ${escapeHtml(l.name)}</label>`).join('')}
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="assign-cancel">Cancel</button>
+                <button class="btn btn-primary" id="assign-save">Save and regenerate</button>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+    const allBox = modal.querySelector('#assign-all');
+    const list = modal.querySelector('#assign-list');
+    const sync = () => { list.style.opacity = allBox.checked ? 0.5 : 1; list.querySelectorAll('input').forEach(i => i.disabled = allBox.checked); };
+    allBox.addEventListener('change', sync);
+    sync();
+    modal.querySelector('#assign-cancel').onclick = () => modal.remove();
+    modal.querySelector('#assign-save').onclick = async () => {
+        const ids = allBox.checked ? null : [...list.querySelectorAll('.assign-light:checked')].map(i => parseInt(i.value));
+        const response = await fetch(`api/controllers/${controllerId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ light_ids: ids })
         });
-        
         const result = await response.json();
-        
-        if (result.success) {
-            showNotification(`✅ Firmware built successfully! Ready to flash.`, 'success');
+        if (response.ok) {
+            modal.remove();
+            showNotification('Saved. Install the firmware on this controller to apply it.', 'success');
+            await loadControllers();
+            await loadLights();
         } else {
-            showNotification(`❌ Build failed: ${result.error}`, 'error');
-            console.error('Build output:', result.output);
+            showNotification(result.error || 'Could not save', 'error');
         }
-    } catch (error) {
-        console.error('Build error:', error);
-        showNotification(`❌ Build failed: ${error.message}`, 'error');
-    } finally {
-        if (buildBtn) {
-            buildBtn.disabled = false;
-            buildBtn.textContent = originalText;
-        }
-    }
+    };
 }
 
-async function flashFirmware(controllerName, eventOrButton = null) {
-    // Handle both event-based (button click) and programmatic calls
-    const flashBtn = eventOrButton?.target || eventOrButton;
-    const originalText = flashBtn?.textContent;
-    
-    try {
-        // Get available serial ports
-        const portsResponse = await fetch('api/esphome/ports');
-        const portsData = await portsResponse.json();
-        
-        let port = 'auto';
-        if (portsData.ports && portsData.ports.length > 0) {
-            // Show port selection dialog
-            port = await showPortSelectionDialog(portsData.ports);
-            if (!port) return; // User cancelled
-        }
-        
-        if (flashBtn) {
-            flashBtn.disabled = true;
-            flashBtn.textContent = '⚡ Flashing...';
-        }
-        showNotification(`Flashing firmware to ${controllerName}... Keep ESP32 connected!`, 'info');
-        
-        const response = await fetch(`api/esphome/flash/${controllerName}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ port })
-        });
-        
-        const result = await response.json();
-        
-        if (result.success) {
-            showNotification(`✅ Firmware flashed successfully! ESP32 is rebooting.`, 'success');
-        } else {
-            showNotification(`❌ Flash failed: ${result.error}`, 'error');
-            console.error('Flash output:', result.output);
-        }
-    } catch (error) {
-        console.error('Flash error:', error);
-        showNotification(`❌ Flash failed: ${error.message}`, 'error');
-    } finally {
-        if (flashBtn) {
-            flashBtn.disabled = false;
-            flashBtn.textContent = originalText;
-        }
+const pollingJobs = new Set();
+
+async function startFirmwareJob(controllerName, endpoint, body, label) {
+    const response = await fetch(`api/esphome/${endpoint}/${controllerName}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+        showNotification(`❌ ${result.error || 'Could not start ' + label}`, 'error');
+        return false;
     }
+    showNotification(`${label} started for ${controllerName}. The first build downloads the toolchain and can take 10+ minutes; you can leave this page.`, 'info');
+    pollFirmwareJob(controllerName);
+    return true;
 }
 
-async function buildAndFlash(controllerName, eventOrButton = null) {
-    // Handle both event-based (button click) and programmatic calls
-    const btn = eventOrButton?.target || eventOrButton;
-    const originalText = btn?.textContent;
-    
-    try {
-        if (btn) {
-            btn.disabled = true;
-            btn.textContent = '🚀 Building...';
+function pollFirmwareJob(controllerName) {
+    if (pollingJobs.has(controllerName)) return;
+    pollingJobs.add(controllerName);
+    const tick = async () => {
+        try {
+            const response = await fetch(`api/esphome/job/${controllerName}`);
+            if (!response.ok) { pollingJobs.delete(controllerName); return; }
+            const job = await response.json();
+            const badge = document.getElementById(`job-${controllerName}`);
+            if (badge) badge.textContent = job.running ? `⏳ ${job.action === 'compile' ? 'Building' : 'Installing'} (${job.elapsed}s)` : '';
+            if (currentLogController === controllerName) renderLogText(job.output);
+            if (job.running) { setTimeout(tick, 3000); return; }
+            pollingJobs.delete(controllerName);
+            showNotification(job.success ? `✅ ${controllerName}: ${job.action.replace('_', ' + ')} finished` :
+                                           `❌ ${controllerName}: ${job.error || 'failed'} (see 📋 Output)`, job.success ? 'success' : 'error');
+            loadControllers();
+        } catch (e) {
+            pollingJobs.delete(controllerName);
         }
-        
-        // First, build
-        showNotification(`Building firmware for ${controllerName}...`, 'info');
-        const buildResponse = await fetch(`api/esphome/build/${controllerName}`, {
-            method: 'POST'
-        });
-        const buildResult = await buildResponse.json();
-        
-        if (!buildResult.success) {
-            showNotification(`❌ Build failed: ${buildResult.error}`, 'error');
-            return;
-        }
-        
-        if (btn) {
-            btn.textContent = '🚀 Flashing...';
-        }
-        
-        // Get port
-        const portsResponse = await fetch('api/esphome/ports');
-        const portsData = await portsResponse.json();
-        let port = 'auto';
-        if (portsData.ports && portsData.ports.length > 0) {
-            port = await showPortSelectionDialog(portsData.ports);
-            if (!port) return;
-        }
-        
-        // Then, flash
-        showNotification(`Flashing firmware to ${controllerName}...`, 'info');
-        const flashResponse = await fetch(`api/esphome/flash/${controllerName}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ port })
-        });
-        const flashResult = await flashResponse.json();
-        
-        if (flashResult.success) {
-            showNotification(`✅ Build & Flash complete! ESP32 is ready.`, 'success');
-        } else {
-            showNotification(`❌ Flash failed: ${flashResult.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Build & flash error:', error);
-        showNotification(`❌ Failed: ${error.message}`, 'error');
-    } finally {
-        if (btn) {
-            btn.disabled = false;
-            btn.textContent = originalText;
-        }
+    };
+    tick();
+}
+
+async function buildFirmware(controllerName, button = null) {
+    await startFirmwareJob(controllerName, 'build', {}, 'Build');
+}
+
+async function choosePort() {
+    const portsResponse = await fetch('api/esphome/ports');
+    const portsData = await portsResponse.json();
+    if (portsData.ports && portsData.ports.length > 0) {
+        // Offer USB ports, with Wi-Fi (OTA) as the default.
+        return await showPortSelectionDialog(['OTA', ...portsData.ports]);
     }
+    return 'OTA';
+}
+
+async function installFirmware(controllerName, button = null) {
+    const port = await choosePort();
+    if (!port) return;
+    await startFirmwareJob(controllerName, 'install', { port }, 'Install');
+}
+
+async function flashFirmware(controllerName, button = null) {
+    const port = await choosePort();
+    if (!port) return;
+    await startFirmwareJob(controllerName, 'flash', { port }, 'Install');
+}
+
+async function buildAndFlash(controllerName, button = null) {
+    await installFirmware(controllerName, button);
 }
 
 function showPortSelectionDialog(ports) {
@@ -2121,21 +2139,18 @@ function showPortSelectionDialog(ports) {
         modal.className = 'modal';
         modal.style.display = 'block';
         
-        const portOptions = ports.map(port => 
+        const portOptions = ports.map((port, i) =>
             `<label style="display: block; margin: 10px 0;">
-                <input type="radio" name="port" value="${port}"> ${port}
+                <input type="radio" name="port" value="${port}" ${i === 0 ? 'checked' : ''}> ${port === 'OTA' ? 'Wi-Fi (OTA, controller already running ESPHome)' : 'USB: ' + port}
             </label>`
         ).join('');
         
         modal.innerHTML = `
             <div class="modal-content">
-                <h2>Select Serial Port</h2>
-                <p>Choose the USB port where your ESP32 is connected:</p>
+                <h2>Install method</h2>
+                <p>The first install on a new ESP32 has to be over USB.</p>
                 <div style="margin: 20px 0;">
                     ${portOptions}
-                    <label style="display: block; margin: 10px 0;">
-                        <input type="radio" name="port" value="auto" checked> Auto-detect
-                    </label>
                 </div>
                 <div style="display: flex; gap: 10px; justify-content: flex-end;">
                     <button class="btn btn-secondary" onclick="this.closest('.modal').remove(); window.portSelected(null)">Cancel</button>
@@ -2253,8 +2268,11 @@ function visitController(controllerName) {
 }
 
 function viewLogs(controllerName) {
-    // Open ESPHome logs page for this controller
-    window.open(`/5c53de3b_esphome/ingress/${controllerName}/logs`, '_blank');
+    // Show the build/install output of this controller in the Logs tab.
+    document.querySelector('.tab-btn[data-tab="logs"]').click();
+    const select = document.getElementById('log-controller');
+    if (select) select.value = controllerName;
+    switchLogController();
 }
 
 async function regenerateYAML(controllerName) {
@@ -2425,16 +2443,20 @@ async function initLogViewer() {
     controllerSelect.innerHTML = '<option value="">Select Controller...</option>';
     controllers.forEach(c => {
         const option = document.createElement('option');
-        option.value = c.name;
+        option.value = c.name.toLowerCase().replace(/ /g, '-');
         option.textContent = c.name;
         controllerSelect.appendChild(option);
     });
-    
-    // Auto-select first controller if available and nothing is selected
-    if (controllers.length > 0 && !currentLogController) {
-        controllerSelect.value = controllers[0].name;
-        switchLogController();
-    }
+    // Keep the current selection; output is only polled once a controller is picked.
+    if (currentLogController) controllerSelect.value = currentLogController;
+}
+
+function renderLogText(text) {
+    const logViewer = document.getElementById('log-viewer');
+    if (!logViewer) return;
+    const atBottom = logViewer.scrollTop + logViewer.clientHeight >= logViewer.scrollHeight - 20;
+    logViewer.textContent = text || '';
+    if (atBottom) logViewer.scrollTop = logViewer.scrollHeight;
 }
 
 function switchLogController() {
@@ -2499,12 +2521,9 @@ async function fetchLogs() {
         
         // Handle raw text logs from ESPHome
         if (data.raw && typeof data.logs === 'string') {
-            const logViewer = document.getElementById('log-viewer');
-            if (logViewer) {
-                logViewer.textContent = data.logs;
-                // Auto-scroll to bottom
-                logViewer.scrollTop = logViewer.scrollHeight;
-            }
+            renderLogText(data.logs);
+            // Nothing will change until a build runs; stop polling.
+            if (!data.job || !data.job.running) stopLogStream();
             return;
         }
         

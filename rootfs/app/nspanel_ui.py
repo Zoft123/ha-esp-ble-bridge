@@ -80,7 +80,7 @@ class NSPanelUIGenerator:
         """Generate UI elements for a single light card"""
         commands = []
         
-        state = light['state']
+        state = self.bridge.light_state(light_id)
         is_on = state.get('state', False)
         name = light['name']
         
@@ -191,7 +191,7 @@ class NSPanelUIGenerator:
         
         try:
             # Method 1: Via MQTT (if NSPanel uses MQTT)
-            if self.bridge.mqtt_client:
+            if getattr(self.bridge, 'mqtt_client', None):
                 for cmd in commands:
                     topic = f"{self.nspanel_entity}/command"
                     self.bridge.mqtt_client.publish(topic, cmd)

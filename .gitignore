@@ -32,7 +32,6 @@ Thumbs.db
 
 # Test files
 test/
-tests/
 *.test
 
 # Sensitive data
@@ -77,3 +76,7 @@ PAIRING_INTEGRATION_COMPLETE.md
 esphome-build/
 standalone/
 docs/
+
+# Never commit BRMesh exports: they contain the mesh key
+brmesh_export*.json
+BRMESH_BACKUP*

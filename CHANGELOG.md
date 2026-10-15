@@ -5,6 +5,59 @@ All notable changes to the ESP BLE Bridge add-on will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.0] - 2026-10-15
+
+### Added
+- **Upload your BRMesh export from the browser.** "Import from BRMesh App" opens a dialog where you pick
+  the app's export (`BRMESH_BACKUP…`, any file name) from your phone or computer. The add-on decrypts it,
+  shows the lights it found and imports the mesh key, every light ID, name and type (RGB+CW/WW vs RGBW).
+  The app's share code and `setting.xml` are accepted too. Nothing has to be copied into `/share` any more
+  (that path was never mapped into the add-on, so the old import could not work).
+- **"All Lights" entity**: one BLE broadcast packet switches every lamp, instead of one packet per lamp.
+- Build and install firmware from the controller card (⚡ Install over USB or Wi-Fi); progress and output
+  are shown while it runs.
+- **All brMesh lamp types**: the importer knows every light type of the app and maps it to RGB+CW/WW, RGBW,
+  RGB, CW/WW white or dimmable; the firmware's `light_type` option gives each the right controls (CW/WW
+  lamps get color temperature, dimmable lamps brightness only). Sockets, curtains, panels, sensors and
+  gateways in the export are listed as skipped instead of becoming fake lights. Unknown light types are
+  imported as full-color lamps and marked as assumed.
+- **Lights per controller**: choose which lights each ESP32 handles (default: all). Useful with several
+  controllers, and for large meshes: the UI warns above 100 lights on one controller (~350 bytes of heap
+  per light entity on the ESP32).
+- **Board choice** when creating a controller (ESP32, S3, C3, C6).
+- Exports with the app's second ("radar") mesh can import either mesh.
+
+### Changed
+- **Bundled FastCon ESPHome components** (based on scross01/esphome-fastcon, MIT) are installed to
+  `/config/esphome/esp_ble_bridge_components`. Builds no longer clone a GitHub fork.
+- **New command scheduler on the ESP32**: the newest state for a light replaces older pending ones, lights
+  are served round-robin, and every command is repeated (default 3x) so lamps that miss one advertisement
+  still get it. Previously every change (including each frame of a 1 s transition) was queued FIFO and
+  advertised once for 50 ms, so commands piled up and lamps missed them.
+- Duplicate light names (common in app exports) get the light ID appended; ESPHome rejects duplicates.
+- Light IDs above 255 (the app's extended addressing) are listed as not supported instead of being dropped.
+- The scheduler sends every light's first transmission before any repeats, so the time until the last
+  lamp reacts grows with one packet per changed light; broadcast and group commands use their own queue
+  keys and groups never interleave with each other.
+- Generated firmware: no BLE scanner or GATT server (they shared the radio with the command advertisements),
+  INFO logging, 0 s transitions, ESP-IDF framework, no web server by default.
+  *Switching an existing controller from Arduino to ESP-IDF may need one install over USB.*
+- Lights no longer switch when an ESP32 reboots (the restored state is not sent).
+- The web UI controls lights through their ESPHome entities in Home Assistant. Effects and scenes work again,
+  paced to what BLE can deliver.
+- State is stored in `/data/brmesh_state.json`; existing lights/controllers are migrated from `options.json`
+  (which the Supervisor overwrites when add-on options are saved).
+- Secrets are written to `/config/esphome/secrets.yaml`, where ESPHome looks for them (the mesh key used to
+  end up only in `/config/secrets.yaml`, so builds failed with an undefined secret).
+- MQTT is optional. The fake MQTT lights from older versions (they never sent anything) are removed once.
+- The web UI polls far less (no GitHub request every 5 seconds, no mDNS probes per refresh).
+
+### Removed
+- BLE scanning and pairing from the ESP32. It read a `/logs` page ESPHome does not serve, and reset lamps
+  only answer after the app's scan request; the pairing reply is built by the app's native library, which
+  has not been reverse engineered. Pair lamps with the BRMesh app and import the export instead.
+- Diagnostics endpoints that returned the API encryption key and secrets file to the browser.
+
 ## [0.50.10] - 2025-11-29
 
 ### Added

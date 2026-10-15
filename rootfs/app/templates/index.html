@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP BLE Bridge - Light Management</title>
-    <link rel="stylesheet" href="static/css/style.css?v=0.30.19">
+    <link rel="stylesheet" href="static/css/style.css?v=0.60.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
@@ -26,12 +26,11 @@
         <header>
             <div class="header-title">
                 <h1>🔆 ESP BLE Bridge</h1>
-                <span class="version">v0.50.7 (Firmware: <span id="firmware-version-display">checking...</span>)</span>
+                <span class="version">v0.60.0 (Firmware: <span id="firmware-version-display">{{ version }}</span>)</span>
             </div>
             <div class="header-controls">
                 <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle Dark Mode">🌙</button>
                 <button id="import-app-btn" class="btn btn-primary">📱 Import from BRMesh App</button>
-                <button id="scan-btn" class="btn btn-primary">🔍 Scan for Lights</button>
                 <button id="refresh-btn" class="btn btn-secondary">🔄 Refresh</button>
             </div>
         </header>
@@ -85,61 +84,21 @@
         <!-- Pairing Tab -->
         <div id="pairing-tab" class="tab-content">
             <div class="pairing-panel">
-                <h2>🔗 Pair New BRMesh Devices</h2>
+                <h2>🔗 Adding lights</h2>
                 <div class="pairing-instructions">
-                    <h3>Pairing Instructions:</h3>
                     <ol>
-                        <li>Factory reset your BRMesh light (usually: turn on/off 5 times quickly)</li>
-                        <li>Light should start flashing rapidly in pairing mode</li>
-                        <li>Click "Scan for Devices" below</li>
-                        <li>Select your device and click "Pair"</li>
+                        <li>Pair the lights with the <strong>BRMesh</strong> app on your phone as usual.</li>
+                        <li>In the app, export your configuration (it creates a <code>BRMESH_BACKUP…</code> file).</li>
+                        <li>Click <strong>Import from BRMesh App</strong> and choose that file from your phone or computer.
+                            The mesh key, every light's ID, name and type are read from it.</li>
+                        <li>Install the firmware on your ESP32 controller(s) from the Controllers tab.</li>
                     </ol>
                     <div class="alert alert-info">
-                        <strong>✨ Native Pairing!</strong> This is the first implementation that pairs BRMesh devices without the Android app.
+                        Pairing reset lights directly from the ESP32 is not supported: the app's pairing reply comes
+                        from its native library, which has not been reverse engineered. Lights paired in the app work
+                        right away once the export is imported.
                     </div>
-                </div>
-                
-                <div class="pairing-controls">
-                    <button id="scan-pairing-btn" class="btn btn-primary">📡 Scan for Devices</button>
-                    <div id="pairing-status" class="status-message" style="display: none;"></div>
-                </div>
-                
-                <div class="discovered-devices" id="discovered-devices" style="display: none;">
-                    <h3>Discovered Devices</h3>
-                    <div id="devices-list">
-                        <!-- Populated by JavaScript -->
-                    </div>
-                </div>
-                
-                <div class="pairing-settings">
-                    <h3>Pairing Settings</h3>
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" id="auto-pair-mode" />
-                            Auto-Pair Mode (Experimental)
-                        </label>
-                        <small>Automatically pair discovered devices without confirmation</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="pairing-address">Next Device Address:</label>
-                        <input type="number" id="pairing-address" min="1" max="255" value="1" />
-                        <small>Unique address for this device (1-255)</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="pairing-group">Group ID:</label>
-                        <input type="number" id="pairing-group" min="1" max="255" value="1" />
-                        <small>Group for controlling multiple lights together</small>
-                    </div>
-                </div>
-                
-                <div class="pairing-test">
-                    <h3>Test Control Commands</h3>
-                    <div class="test-controls">
-                        <button id="test-on-btn" class="btn btn-success">💡 Test ON</button>
-                        <button id="test-off-btn" class="btn btn-danger">🔴 Test OFF</button>
-                        <button id="test-brightness-btn" class="btn btn-primary">🔆 Test Brightness</button>
-                    </div>
-                    <div id="test-status" class="status-message" style="display: none;"></div>
+                    <button class="btn btn-primary" onclick="openImportModal()">📱 Import from BRMesh App</button>
                 </div>
             </div>
         </div>
@@ -294,41 +253,6 @@
                 </div>
 
                 <div class="settings-section">
-                    <h3>🔧 Diagnostics</h3>
-                    <p><small>Test git and GitHub connectivity for external component downloads</small></p>
-                    <button class="btn btn-secondary" onclick="testGitConnectivity()">🧪 Test Git/GitHub Connection</button>
-                    <div id="git-test-results" style="margin-top: 10px; font-family: monospace; white-space: pre-wrap; background: #f5f5f5; padding: 10px; border-radius: 5px; display: none;"></div>
-                </div>
-
-                <div class="settings-section">
-                    <h3>MQTT Configuration</h3>
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" id="use-addon-mqtt" checked onchange="toggleMQTTSection()" />
-                            Use Home Assistant's MQTT service (recommended)
-                        </label>
-                    </div>
-                    <div id="custom-mqtt-section" style="display: none;">
-                        <div class="form-group">
-                            <label for="mqtt-host">MQTT Broker Host:</label>
-                            <input type="text" id="mqtt-host" placeholder="mqtt.example.com" />
-                        </div>
-                        <div class="form-group">
-                            <label for="mqtt-port">MQTT Port:</label>
-                            <input type="number" id="mqtt-port" value="1883" />
-                        </div>
-                        <div class="form-group">
-                            <label for="mqtt-user">MQTT Username:</label>
-                            <input type="text" id="mqtt-user" />
-                        </div>
-                        <div class="form-group">
-                            <label for="mqtt-password">MQTT Password:</label>
-                            <input type="password" id="mqtt-password" />
-                        </div>
-                    </div>
-                </div>
-
-                <div class="settings-section">
                     <h3>Map Configuration</h3>
                     <div class="form-group">
                         <label>
@@ -359,20 +283,20 @@
                     <h3>Features</h3>
                     <div class="form-group">
                         <label>
-                            <input type="checkbox" id="discovery-enabled" checked />
-                            MQTT Auto-Discovery (Home Assistant)
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <label>
                             <input type="checkbox" id="generate-esphome" checked />
                             Auto-generate ESPHome Configurations
                         </label>
                     </div>
                     <div class="form-group">
                         <label>
-                            <input type="checkbox" id="enable-ble" checked />
-                            BLE Device Discovery
+                            <input type="checkbox" id="include-all-lights" checked />
+                            "All Lights" entity (switches every lamp with one BLE packet)
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="enable-web-server" />
+                            ESP32 web server (uses RAM and CPU on the controller; off is recommended)
                         </label>
                     </div>
                     <div class="form-group">
@@ -388,13 +312,22 @@
                 </div>
 
                 <div class="settings-section">
-                    <h3>Import/Export</h3>
+                    <h3>BLE Transmission</h3>
                     <div class="form-group">
-                        <label for="app-config-path">BRMesh App Export Path:</label>
-                        <input type="text" id="app-config-path" value="/share/brmesh_export.json" />
-                        <small>Path to JSON export from BRMesh app</small>
+                        <label for="adv-duration">Advertising time per packet (ms):</label>
+                        <input type="number" id="adv-duration" min="20" max="500" value="40" />
+                        <small>Longer is more reliable but slower when many lights change at once.</small>
                     </div>
-                    <button class="btn btn-secondary" onclick="importFromApp()">📱 Import from App</button>
+                    <div class="form-group">
+                        <label for="adv-repeats">Repeats per command:</label>
+                        <input type="number" id="adv-repeats" min="1" max="10" value="3" />
+                        <small>Raise this if lamps far from the ESP32 miss commands. Reinstall the firmware after changing.</small>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Import/Export</h3>
+                    <button class="btn btn-secondary" onclick="openImportModal()">📱 Import from BRMesh App</button>
                     <button class="btn btn-secondary" onclick="exportConfig()">💾 Export Configuration</button>
                 </div>
 
@@ -428,7 +361,38 @@
         </div>
     </div>
 
-    <script src="static/js/app.js?v=0.50.7.1732749000"></script>
+    <!-- Import Modal -->
+    <div id="import-modal" class="modal">
+        <div class="modal-content import-modal-content">
+            <span class="close" onclick="closeImportModal()">&times;</span>
+            <h2>📱 Import from BRMesh App</h2>
+            <p>Choose the export file from the BRMesh app (named <code>BRMESH_BACKUP…</code>, or however you
+               renamed it). It is read in the browser and sent to the add-on; nothing has to be copied into
+               Home Assistant first.</p>
+            <div id="import-drop" class="import-drop">
+                <input type="file" id="import-file" />
+                <div>Drop the file here or tap to choose it</div>
+            </div>
+            <details>
+                <summary>Or paste the text of the file / the app's share code</summary>
+                <textarea id="import-text" rows="4" placeholder="Paste here"></textarea>
+                <button class="btn btn-secondary btn-sm" onclick="previewImport()">Read pasted text</button>
+            </details>
+            <div id="import-preview" style="display: none;">
+                <div id="import-summary"></div>
+                <div class="import-table-wrap"><table class="import-table" id="import-table"></table></div>
+                <label><input type="checkbox" id="import-replace" /> Replace the current light list (remove lights that are not in the file)</label><br>
+                <label><input type="checkbox" id="import-names" checked /> Use the names from the app for existing lights</label>
+                <div class="modal-actions">
+                    <button class="btn btn-primary" id="import-apply-btn" onclick="applyImport()">Import</button>
+                    <button class="btn btn-secondary" onclick="closeImportModal()">Cancel</button>
+                </div>
+            </div>
+            <div id="import-error" class="status-message error" style="display: none;"></div>
+        </div>
+    </div>
+
+    <script src="static/js/app.js?v=0.60.0"></script>
     <script>
     function toggleMapSettings() {
         const mapEnabled = document.getElementById('map-enabled').checked;

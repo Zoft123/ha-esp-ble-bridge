@@ -1,235 +1,147 @@
 #!/usr/bin/env python3
 """
-ESPHome Builder - Compile and flash ESP32 controllers directly from the add-on
+Compile and flash the ESP32 controllers from the add-on.
+
+Builds take minutes, so they run as background jobs; the web UI polls their status and output
+instead of holding an HTTP request (and one of the web server's threads) open the whole time.
 """
+import collections
+import glob
+import logging
 import os
 import subprocess
-import logging
-from typing import Dict, Optional
+import threading
+import time
+from typing import Dict, List, Optional
+
+from esphome_generator import controller_slug
+from state_store import ESPHOME_DIR
 
 logger = logging.getLogger(__name__)
 
+COMPILE_TIMEOUT = 1800
+UPLOAD_TIMEOUT = 600
+MAX_OUTPUT_LINES = 400
+
+
+class BuildJob:
+    def __init__(self, controller: str, action: str):
+        self.controller = controller
+        self.action = action
+        self.started = time.time()
+        self.finished: Optional[float] = None
+        self.success: Optional[bool] = None
+        self.error: Optional[str] = None
+        self.output = collections.deque(maxlen=MAX_OUTPUT_LINES)
+
+    @property
+    def running(self) -> bool:
+        return self.finished is None
+
+    def to_dict(self) -> Dict:
+        return {
+            'controller': self.controller,
+            'action': self.action,
+            'running': self.running,
+            'success': self.success,
+            'error': self.error,
+            'started': self.started,
+            'finished': self.finished,
+            'elapsed': round((self.finished or time.time()) - self.started),
+            'output': '\n'.join(self.output),
+        }
+
+
 class ESPHomeBuilder:
-    """Build and flash ESP32 controllers using ESPHome"""
-    
     def __init__(self, bridge):
         self.bridge = bridge
-        self.build_dir = "/config/esphome"
-        self.secrets_file = os.path.join(self.build_dir, "secrets.yaml")
-        
-        # Ensure build directory exists
-        os.makedirs(self.build_dir, exist_ok=True)
-    
-    def compile_firmware(self, controller_name: str) -> Dict:
-        """Compile firmware for a controller
-        
-        Args:
-            controller_name: Name of the controller (used for filename)
-            
-        Returns:
-            Dict with status and firmware path
-        """
-        yaml_file = os.path.join(self.build_dir, f"{controller_name.lower().replace(' ', '-')}.yaml")
-        
-        if not os.path.exists(yaml_file):
-            return {'success': False, 'error': f'Config file not found: {yaml_file}'}
-        
+        self.build_dir = ESPHOME_DIR
+        self.jobs: Dict[str, BuildJob] = {}
+        self._lock = threading.Lock()
+
+    def yaml_path(self, controller_name: str) -> str:
+        return os.path.join(self.build_dir, f"{controller_slug(controller_name)}.yaml")
+
+    def job(self, controller_name: str) -> Optional[BuildJob]:
+        return self.jobs.get(controller_slug(controller_name))
+
+    def start(self, controller_name: str, action: str, port: str = 'OTA') -> BuildJob:
+        """Start 'compile', 'upload' or 'compile_upload' in the background."""
+        key = controller_slug(controller_name)
+        with self._lock:
+            current = self.jobs.get(key)
+            if current and current.running:
+                raise RuntimeError(f"A {current.action} is already running for {controller_name}")
+            yaml_file = self.yaml_path(controller_name)
+            if not os.path.exists(yaml_file):
+                raise FileNotFoundError(f"Config file not found: {yaml_file}. Generate the ESPHome config first.")
+            job = BuildJob(controller_name, action)
+            self.jobs[key] = job
+        threading.Thread(target=self._run_job, args=(job, yaml_file, port), daemon=True,
+                         name=f"esphome-{action}-{key}").start()
+        return job
+
+    def _run_job(self, job: BuildJob, yaml_file: str, port: str):
         try:
-            logger.info(f"🔨 Compiling firmware for {controller_name}...")
-            logger.info(f"📄 Config file: {yaml_file}")
-            logger.info("⏳ This may take 5-10 minutes for first build (downloading external components)...")
-            
-            # Run ESPHome compile command with extended git timeout settings
-            env = {
-                **os.environ,
-                'PLATFORMIO_CORE_DIR': '/config/.platformio',
-                'PLATFORMIO_PENV_DISABLE': '1',
-                'PIO_INSTALL_DEVPLATFORM_SILENT': 'yes',
-                'GIT_HTTP_LOW_SPEED_LIMIT': '0',
-                'GIT_HTTP_LOW_SPEED_TIME': '999999',
-                'GIT_CURL_VERBOSE': '1',
-                'GIT_TRACE': '1'
-            }
-            
-            result = subprocess.run(
-                ['esphome', 'compile', yaml_file],
-                capture_output=True,
-                text=True,
-                timeout=1200,  # 20 minute timeout for first build with slow git clone
-                env=env
-            )
-            
-            # Log full output for debugging
-            if result.stdout:
-                logger.info(f"ESPHome stdout:\n{result.stdout}")
-            if result.stderr:
-                logger.error(f"ESPHome stderr:\n{result.stderr}")
-            
-            if result.returncode == 0:
-                # Find the compiled firmware binary
-                firmware_path = self._find_firmware_binary(controller_name)
-                logger.info(f"✅ Compilation successful: {firmware_path}")
-                return {
-                    'success': True,
-                    'firmware_path': firmware_path,
-                    'output': result.stdout
-                }
-            else:
-                logger.error(f"❌ Compilation failed with return code: {result.returncode}")
-                
-                # Parse error for helpful message
-                error_msg = result.stderr
-                if "github.com" in error_msg or "Cloning" in error_msg or "git" in error_msg.lower():
-                    error_msg = f"Failed to download external component from GitHub. This may be a temporary network issue. Full error: {error_msg}"
-                
-                return {
-                    'success': False,
-                    'error': error_msg,
-                    'output': result.stdout,
-                    'stderr': result.stderr
-                }
-                
-        except subprocess.TimeoutExpired:
-            logger.error("⏱️ Compilation timeout")
-            return {'success': False, 'error': 'Compilation timeout (20 minutes). The external component download may be failing due to network issues. Check your internet connection and GitHub accessibility.'}
+            ok = True
+            if job.action in ('compile', 'compile_upload'):
+                ok = self._run(job, ['esphome', 'compile', yaml_file], COMPILE_TIMEOUT)
+            if ok and job.action in ('upload', 'compile_upload'):
+                device = port if port and port != 'auto' else 'OTA'
+                ok = self._run(job, ['esphome', 'upload', '--device', device, yaml_file], UPLOAD_TIMEOUT)
+            job.success = ok
+            if not ok and not job.error:
+                job.error = self._summarize_error(job)
         except Exception as e:
-            logger.error(f"❌ Compilation error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def flash_firmware(self, controller_name: str, port: str = 'auto') -> Dict:
-        """Flash firmware to ESP32
-        
-        Args:
-            controller_name: Name of the controller
-            port: Serial port (e.g., /dev/ttyUSB0) or 'auto' for auto-detect
-            
-        Returns:
-            Dict with status
-        """
-        yaml_file = os.path.join(self.build_dir, f"{controller_name.lower().replace(' ', '-')}.yaml")
-        
-        if not os.path.exists(yaml_file):
-            return {'success': False, 'error': f'Config file not found: {yaml_file}'}
-        
+            job.success = False
+            job.error = str(e)
+            logger.error(f"{job.action} for {job.controller} failed: {e}", exc_info=True)
+        finally:
+            job.finished = time.time()
+            logger.info(f"{job.action} for {job.controller} {'succeeded' if job.success else 'failed'} "
+                        f"after {round(job.finished - job.started)}s")
+
+    def _run(self, job: BuildJob, cmd: List[str], timeout: int) -> bool:
+        env = {
+            **os.environ,
+            # /config/.platformio in the add-on, shared with earlier builds
+            'PLATFORMIO_CORE_DIR': os.path.join(os.path.dirname(self.build_dir), '.platformio'),
+            'PIO_INSTALL_DEVPLATFORM_SILENT': 'yes',
+        }
+        job.output.append(f"$ {' '.join(cmd)}")
+        logger.info(f"Running: {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                text=True, bufsize=1, env=env, cwd=self.build_dir)
+        deadline = time.time() + timeout
+        timer = threading.Timer(timeout, proc.kill)
+        timer.start()
         try:
-            logger.info(f"⚡ Flashing firmware to {controller_name} on {port}...")
-            
-            # Build command
-            cmd = ['esphome', 'run', yaml_file]
-            if port != 'auto':
-                cmd.extend(['--device', port])
-            
-            # Run ESPHome upload command
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600
-            )
-            
-            if result.returncode == 0:
-                logger.info(f"✅ Flashing successful!")
-                return {
-                    'success': True,
-                    'output': result.stdout
-                }
-            else:
-                logger.error(f"❌ Flashing failed: {result.stderr}")
-                return {
-                    'success': False,
-                    'error': result.stderr,
-                    'output': result.stdout
-                }
-                
-        except subprocess.TimeoutExpired:
-            logger.error("⏱️ Flashing timeout")
-            return {'success': False, 'error': 'Flashing timeout (10 minutes)'}
-        except Exception as e:
-            logger.error(f"❌ Flashing error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def compile_and_flash(self, controller_name: str, port: str = 'auto') -> Dict:
-        """Compile and flash in one operation"""
-        logger.info(f"🚀 Starting compile and flash for {controller_name}...")
-        
-        # Compile
-        compile_result = self.compile_firmware(controller_name)
-        if not compile_result['success']:
-            return compile_result
-        
-        # Flash
-        flash_result = self.flash_firmware(controller_name, port)
-        return flash_result
-    
+            for line in proc.stdout:
+                job.output.append(line.rstrip())
+            proc.wait()
+        finally:
+            timer.cancel()
+        if time.time() >= deadline:
+            job.error = f"Timed out after {timeout // 60} minutes"
+            return False
+        return proc.returncode == 0
+
+    @staticmethod
+    def _summarize_error(job: BuildJob) -> str:
+        lines = [l for l in job.output if 'error' in l.lower() or 'failed' in l.lower()]
+        for line in job.output:
+            if "Secret '" in line or 'secrets.yaml' in line:
+                return line.strip()
+        return (lines[-1] if lines else (job.output[-1] if job.output else 'Unknown error')).strip()
+
     def list_serial_ports(self) -> list:
-        """List available serial ports for flashing"""
-        try:
-            # Look for common ESP32 serial ports
-            ports = []
-            
-            # Linux/Home Assistant OS
-            for device in ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', '/dev/ttyACM1']:
-                if os.path.exists(device):
-                    ports.append(device)
-            
-            return ports
-        except Exception as e:
-            logger.error(f"Error listing serial ports: {e}")
-            return []
-    
-    def _find_firmware_binary(self, controller_name: str) -> Optional[str]:
-        """Find the compiled firmware binary"""
-        # ESPHome typically puts binaries in .esphome/build/<name>/
-        build_name = controller_name.lower().replace(' ', '-')
-        possible_paths = [
-            f"{self.build_dir}/.esphome/build/{build_name}/.pioenvs/{build_name}/firmware.bin",
-            f"{self.build_dir}/.esphome/build/{build_name}/firmware.bin",
-        ]
-        
-        for path in possible_paths:
+        ports = sorted(set(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*') + glob.glob('/dev/serial/by-id/*')))
+        return ports
+
+    def find_firmware_binary(self, controller_name: str) -> Optional[str]:
+        name = controller_slug(controller_name)
+        for path in (f"{self.build_dir}/.esphome/build/{name}/.pioenvs/{name}/firmware.factory.bin",
+                     f"{self.build_dir}/.esphome/build/{name}/.pioenvs/{name}/firmware.bin"):
             if os.path.exists(path):
                 return path
-        
         return None
-    
-    def update_secrets(self, secrets: Dict) -> bool:
-        """Update secrets.yaml file
-        
-        Args:
-            secrets: Dict of secret key-value pairs
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            import yaml
-            
-            # Load existing secrets
-            existing = {}
-            if os.path.exists(self.secrets_file):
-                with open(self.secrets_file, 'r') as f:
-                    existing = yaml.safe_load(f) or {}
-            
-            # Merge with new secrets
-            existing.update(secrets)
-            
-            # Save back
-            with open(self.secrets_file, 'w') as f:
-                yaml.dump(existing, f, default_flow_style=False)
-            
-            logger.info(f"✅ Updated secrets: {list(secrets.keys())}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to update secrets: {e}")
-            return False
-    
-    def generate_api_key(self) -> str:
-        """Generate a random API encryption key for ESPHome"""
-        import secrets
-        import base64
-        
-        # Generate 32 random bytes and encode as base64
-        key_bytes = secrets.token_bytes(32)
-        key = base64.b64encode(key_bytes).decode('ascii')
-        return key

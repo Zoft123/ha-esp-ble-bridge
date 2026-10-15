@@ -1,1888 +1,717 @@
 #!/usr/bin/env python3
 """
-BRMesh Bridge Web UI - Map view, light management, effects control
+Web UI and REST API of the ESP BLE Bridge add-on (served through Home Assistant Ingress).
 """
-from flask import Flask, render_template, jsonify, request, send_from_directory, Response
-from flask_cors import CORS
-from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import logging
 import os
-import requests
-from PIL import Image
-from io import BytesIO
-from esphome_generator import ESPHomeConfigGenerator
-from brmesh_pairing import create_pairing_response
-from brmesh_control import create_control_command, decode_control_command
+import re
 
-logging.basicConfig(level=logging.INFO)
+from flask import Flask, Response, jsonify, render_template, request
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+from brmesh_export import ExportError, mask_key, parse_export, select_mesh
+from effects import EFFECTS
+from esphome_generator import BRIDGE_FIRMWARE_VERSION, LIGHTS_PER_CONTROLLER_WARNING, controller_slug
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='/app/static', template_folder='/app/templates')
-# Handle Home Assistant Ingress reverse proxy headers
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-CORS(app)
+# Exports are small; refuse anything that is clearly not one.
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+
+PAIRING_UNSUPPORTED = (
+    "Pairing new lights from the ESP32 is not supported. Reset lights do not advertise on their own: "
+    "the BRMesh app first broadcasts a scan request and answers with a pairing packet built by its "
+    "native library (libbroadlink_ble.so), which has not been reverse engineered. Pair the lights "
+    "with the BRMesh app, then upload its export (Import from BRMesh App) - the ESP32 controls them "
+    "with the mesh key and light IDs from that file."
+)
+
+
+def error(message, status=400, **extra):
+    return jsonify({'success': False, 'error': message, **extra}), status
+
 
 class WebUI:
     def __init__(self, bridge):
         self.bridge = bridge
         self.setup_routes()
-    
-    def _get_yaml_handler(self):
-        """Get ruamel.yaml instance configured to preserve comments"""
-        from ruamel.yaml import YAML
-        yaml = YAML()
-        yaml.preserve_quotes = True
-        yaml.default_flow_style = False
-        return yaml
-    
-    def _update_ha_secrets(self, wifi_ssid=None, wifi_password=None, network_id=None):
-        """Update Home Assistant's secrets.yaml with WiFi credentials
-        
-        If network_id is provided, uses that specific network from the list.
-        Otherwise, updates the default wifi_ssid/wifi_password for new controllers.
-        Uses ruamel.yaml to preserve comments and formatting.
-        """
-        secrets_path = '/config/secrets.yaml'
-        yaml = self._get_yaml_handler()
-        
-        secrets = {}
-        
-        # Load existing secrets if file exists
-        if os.path.exists(secrets_path):
+
+    # --- helpers -------------------------------------------------------------
+
+    def _controller(self, ident):
+        for c in self.bridge.controllers:
+            if str(c.get('id')) == str(ident) or c.get('name') == ident or controller_slug(c.get('name', '')) == ident:
+                return c
+        return None
+
+    def _light_json(self, light, assigned=None):
+        light_id = light['light_id']
+        return {
+            'on_controller': (light_id in assigned) if assigned is not None else None,
+            'id': light_id,
+            'light_id': light_id,
+            'name': light['name'],
+            'kind': light.get('kind'),
+            'supports_cwww': light.get('supports_cwww', False),
+            'state': self.bridge.light_state(light_id),
+            'location': light.get('location') or {'x': None, 'y': None},
+        }
+
+    def _clean_light_ids(self, value):
+        """None means every light; otherwise a sorted list of known light IDs."""
+        if value is None:
+            return None
+        ids = set()
+        for v in value:
             try:
-                with open(secrets_path, 'r') as f:
-                    secrets = yaml.load(f) or {}
-            except Exception as e:
-                logger.warning(f"Could not read existing secrets.yaml: {e}")
-        
-        # If network_id provided, get credentials from that network
-        if network_id is not None:
-            wifi_ssid = secrets.get(f'wifi_network_{network_id}_ssid')
-            wifi_password = secrets.get(f'wifi_network_{network_id}_password')
-            if not wifi_ssid or not wifi_password:
-                raise ValueError(f"WiFi network {network_id} not found in secrets.yaml")
-        
-        # Validate we have credentials
-        if not wifi_ssid or not wifi_password:
-            raise ValueError("WiFi SSID and password are required")
-        
-        # Update default WiFi credentials (used by ESPHome configs)
-        # Use PlainScalarString to avoid quotes being added
-        from ruamel.yaml.scalarstring import PlainScalarString
-        secrets['wifi_ssid'] = PlainScalarString(str(wifi_ssid))
-        secrets['wifi_password'] = PlainScalarString(str(wifi_password))
-        
-        # Add other common secrets if they don't exist (but preserve existing values)
-        if 'gateway' not in secrets:
-            secrets['gateway'] = '192.168.1.1'
-        if 'subnet' not in secrets:
-            secrets['subnet'] = '255.255.255.0'
-        # Don't overwrite api_encryption_key or ota_password - they should be preserved
-        
-        # Save back to file (preserving comments and formatting)
-        with open(secrets_path, 'w') as f:
-            yaml.dump(secrets, f)
-        
-        # Log the encryption key to verify it wasn't corrupted
-        api_key = secrets.get('api_encryption_key', '')
-        logger.info(f"✅ Updated secrets.yaml with WiFi SSID: {wifi_ssid}")
-        if api_key:
-            logger.info(f"🔑 Preserved api_encryption_key: {api_key[:20]}... (length: {len(api_key)})")
-    
+                ids.add(int(v))
+            except (TypeError, ValueError):
+                pass
+        return sorted(ids)
+
+    def _wifi_networks(self, secrets):
+        networks = []
+        i = 0
+        while f'wifi_network_{i}_ssid' in secrets:
+            networks.append({'id': i, 'ssid': str(secrets[f'wifi_network_{i}_ssid'])})
+            i += 1
+        default = int(secrets.get('default_wifi_network', 0) or 0)
+        for n in networks:
+            n['is_default'] = n['id'] == default or len(networks) == 1
+        if not networks and secrets.get('wifi_ssid'):
+            networks.append({'id': -1, 'ssid': str(secrets['wifi_ssid']), 'is_default': True})
+        return networks
+
+    def _set_active_wifi(self, ssid, password):
+        self.bridge.store.update_secrets({'wifi_ssid': str(ssid), 'wifi_password': str(password)})
+
+    # --- routes ----------------------------------------------------------------
+
     def setup_routes(self):
-        """Setup Flask routes"""
-        
+        bridge = self.bridge
+
         @app.route('/')
         def index():
-            return render_template('index.html')
-        
+            return render_template('index.html', version=BRIDGE_FIRMWARE_VERSION)
+
         @app.route('/api/config')
         def get_config():
-            """Get current configuration"""
-            try:
-                # Return the bridge's runtime config (includes auto-detected location)
-                return jsonify(self.bridge.config)
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
+            return jsonify(bridge.config)
+
         @app.route('/api/firmware/check')
         def check_firmware_version():
-            """Check for firmware updates from GitHub"""
-            try:
-                # Current addon version (hardcoded for now, could read from config.yaml)
-                current_version = "0.50.7"
-                
-                # Query GitHub API for latest firmware release
-                api_url = "https://api.github.com/repos/tofuweasel/esp-ble-bridge-firmware/releases/latest"
-                response = requests.get(api_url, timeout=5)
-                
-                if response.status_code == 200:
-                    release_data = response.json()
-                    latest_version = release_data.get('tag_name', '').lstrip('v')
-                    release_url = release_data.get('html_url', '')
-                    release_notes = release_data.get('body', '')
-                    published_at = release_data.get('published_at', '')
-                    
-                    return jsonify({
-                        'current_version': current_version,
-                        'latest_version': latest_version,
-                        'update_available': latest_version != current_version,
-                        'release_url': release_url,
-                        'release_notes': release_notes,
-                        'published_at': published_at
-                    })
-                else:
-                    return jsonify({
-                        'current_version': current_version,
-                        'error': f'GitHub API returned {response.status_code}'
-                    }), 500
-            except Exception as e:
-                logger.error(f"Error checking firmware version: {e}")
-                return jsonify({
-                    'current_version': current_version,
-                    'error': str(e)
-                }), 500
-        
+            # Firmware is built locally from the bundled components; there is nothing to download.
+            return jsonify({'current_version': BRIDGE_FIRMWARE_VERSION, 'latest_version': BRIDGE_FIRMWARE_VERSION,
+                            'update_available': False})
+
+        # --- lights ---------------------------------------------------------
+
         @app.route('/api/lights')
         def get_lights():
-            """Get all lights with status"""
-            lights = []
-            for light_id, light in self.bridge.lights.items():
-                lights.append({
-                    'id': light_id,
-                    'name': light['name'],
-                    'state': light['state'],
-                    'location': light.get('location', {'x': None, 'y': None}),
-                    'signal_strength': light.get('signal_strength', {})
-                })
-            return jsonify(lights)
-        
+            assigned = set()
+            for c in bridge.controllers:
+                assigned.update(l['light_id'] for l, _ in bridge.esphome_generator.controller_lights(c))
+            return jsonify([self._light_json(bridge.lights[k], assigned if bridge.controllers else None)
+                            for k in sorted(bridge.lights)])
+
         @app.route('/api/lights/<int:light_id>', methods=['POST'])
         def control_light(light_id):
-            """Control a specific light"""
-            try:
-                data = request.json
-                state = data.get('state', True)
-                brightness = data.get('brightness', 255)
-                rgb = tuple(data.get('rgb', [255, 255, 255]))
-                
-                self.bridge.set_light_color(light_id, rgb, brightness, state)
-                return jsonify({'success': True})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
+            if light_id not in bridge.lights:
+                return error('Light not found', 404)
+            data = request.get_json(silent=True) or {}
+            ok = bridge.set_light_color(light_id, tuple(data.get('rgb', [255, 255, 255])),
+                                        int(data.get('brightness', 255)), bool(data.get('state', True)))
+            if not ok:
+                return error("Home Assistant has no entity for this light yet. Flash the controller and add it "
+                             "in Settings → Devices & Services → ESPHome.", 409)
+            return jsonify({'success': True})
+
+        @app.route('/api/lights/<int:light_id>', methods=['PUT'])
+        def update_light(light_id):
+            light = bridge.lights.get(light_id)
+            if not light:
+                return error('Light not found', 404)
+            data = request.get_json(silent=True) or {}
+            if data.get('name'):
+                light['name'] = str(data['name']).strip()
+            if 'supports_cwww' in data:
+                light['supports_cwww'] = bool(data['supports_cwww'])
+            bridge.lights_changed()
+            return jsonify({'success': True, 'light': self._light_json(light)})
+
         @app.route('/api/lights/<int:light_id>/location', methods=['POST'])
         def set_light_location(light_id):
-            """Set light location on map"""
-            try:
-                data = request.json
-                x = data.get('x')
-                y = data.get('y')
-                
-                if light_id in self.bridge.lights:
-                    self.bridge.lights[light_id]['location'] = {'x': x, 'y': y}
-                    self.bridge.save_config()
-                    return jsonify({'success': True})
-                return jsonify({'error': 'Light not found'}), 404
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/controllers')
-        def get_controllers():
-            """Get all ESP32 controllers with enhanced status info"""
-            controllers_with_status = []
-            for controller in self.bridge.controllers:
-                # Add computed fields for web UI display
-                controller_info = controller.copy()
-                controller_info['online'] = controller.get('status') == 'online'
-                controller_info['config_status'] = 'configured' if controller.get('name') else 'no_config'
-                controllers_with_status.append(controller_info)
-            return jsonify(controllers_with_status)
-        
-        @app.route('/api/controllers/<controller_name>/signal', methods=['GET'])
-        def get_controller_signal(controller_name):
-            """Get signal strength from controller to all lights"""
-            # This would query the ESP32 for RSSI values
-            return jsonify(self.bridge.get_controller_signal_map(controller_name))
-        
-        @app.route('/api/controllers/<controller_id>/location', methods=['PUT'])
-        def update_controller_location(controller_id):
-            """Update controller location on map"""
-            try:
-                data = request.json
-                x = data.get('x')
-                y = data.get('y')
-                
-                if x is None or y is None:
-                    return jsonify({'success': False, 'error': 'x and y coordinates required'}), 400
-                
-                # Update controller location in config
-                if 'controllers' not in self.bridge.config:
-                    self.bridge.config['controllers'] = []
-                
-                for controller in self.bridge.config['controllers']:
-                    if controller.get('id') == controller_id or controller.get('name') == controller_id:
-                        controller['location'] = {'x': x, 'y': y}
-                        self.bridge.save_config()
-                        return jsonify({'success': True})
-                
-                return jsonify({'success': False, 'error': 'Controller not found'}), 404
-                
-            except Exception as e:
-                return jsonify({'success': False, 'error': str(e)}), 500
-        
-        @app.route('/api/controllers/<int:controller_id>', methods=['PUT'])
-        def update_controller(controller_id):
-            """Update controller details"""
-            try:
-                if 'controllers' not in self.bridge.config:
-                    return jsonify({'success': False, 'error': 'No controllers configured'}), 404
-                
-                data = request.json
-                controllers = self.bridge.config['controllers']
-                controller = next((c for c in controllers if c.get('id') == controller_id), None)
-                
-                if not controller:
-                    return jsonify({'success': False, 'error': 'Controller not found'}), 404
-                
-                # Update fields
-                if 'name' in data:
-                    controller['name'] = data['name']
-                if 'ip' in data:
-                    controller['ip'] = data['ip']
-                if 'mac' in data:
-                    controller['mac'] = data['mac']
-                
-                self.bridge.save_config()
-                
-                logger.info(f"✏️  Updated controller: {controller.get('name')} (ID: {controller_id})")
-                return jsonify({'success': True, 'controller': controller})
-                
-            except Exception as e:
-                logger.error(f"Failed to update controller: {e}")
-                return jsonify({'success': False, 'error': str(e)}), 500
-        
-        @app.route('/api/controllers/<int:controller_id>', methods=['DELETE'])
-        def delete_controller(controller_id):
-            """Delete a controller"""
-            try:
-                if 'controllers' not in self.bridge.config:
-                    return jsonify({'success': False, 'error': 'No controllers configured'}), 404
-                
-                # Find and remove controller
-                controllers = self.bridge.config['controllers']
-                controller = next((c for c in controllers if c.get('id') == controller_id), None)
-                
-                if not controller:
-                    return jsonify({'success': False, 'error': 'Controller not found'}), 404
-                
-                controllers.remove(controller)
-                self.bridge.save_config()
-                
-                logger.info(f"🗑️  Deleted controller: {controller.get('name')} (ID: {controller_id})")
-                return jsonify({'success': True})
-                
-            except Exception as e:
-                logger.error(f"Failed to delete controller: {e}")
-                return jsonify({'success': False, 'error': str(e)}), 500
-        
-        @app.route('/api/esphome/build-status/<controller_name>')
-        def get_build_status(controller_name):
-            """Check if firmware has been built for a controller"""
-            try:
-                # Check for .bin file in ESPHome build directory
-                build_path = f'/config/esphome/.esphome/build/{controller_name}/.pioenvs/{controller_name}/firmware.bin'
-                built = os.path.exists(build_path)
-                
-                return jsonify({
-                    'built': built,
-                    'path': build_path if built else None
-                })
-            except Exception as e:
-                return jsonify({'built': False, 'error': str(e)}), 500
-        
-        @app.route('/api/effects', methods=['GET'])
-        def list_effects():
-            """List available effects"""
-            effects = [
-                {'name': 'rainbow', 'params': ['speed', 'brightness']},
-                {'name': 'color_loop', 'params': ['colors', 'interval']},
-                {'name': 'twinkle', 'params': ['color', 'speed']},
-                {'name': 'fire', 'params': ['intensity']},
-                {'name': 'christmas', 'params': ['interval']},
-                {'name': 'halloween', 'params': ['interval']},
-                {'name': 'strobe', 'params': ['color', 'frequency']},
-                {'name': 'breathe', 'params': ['color', 'speed']},
-            ]
-            return jsonify(effects)
-        
-        @app.route('/api/effects/<effect_name>', methods=['POST'])
-        def start_effect(effect_name):
-            """Start an effect on selected lights"""
-            try:
-                data = request.json
-                light_ids = data.get('light_ids', [])
-                params = data.get('params', {})
-                
-                self.bridge.effects.start_effect(light_ids, effect_name, **params)
-                return jsonify({'success': True})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/effects/stop', methods=['POST'])
-        def stop_effects():
-            """Stop all effects"""
-            try:
-                data = request.json
-                effect_id = data.get('effect_id')
-                
-                if effect_id:
-                    self.bridge.effects.stop_effect(effect_id)
-                else:
-                    # Stop all
-                    for effect_id in list(self.bridge.effects.running_effects.keys()):
-                        self.bridge.effects.stop_effect(effect_id)
-                
-                return jsonify({'success': True})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/scenes', methods=['GET'])
-        def list_scenes():
-            """List saved scenes"""
-            try:
-                with open('/data/options.json', 'r') as f:
-                    config = json.load(f)
-                return jsonify(config.get('scenes', []))
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/scenes', methods=['POST'])
-        def create_scene():
-            """Create a new scene"""
-            try:
-                scene_data = request.json
-                # Save scene to config
-                self.bridge.config.setdefault('scenes', []).append(scene_data)
-                self.bridge.save_config()
-                return jsonify({'success': True})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/scenes/<scene_name>', methods=['POST'])
-        def apply_scene(scene_name):
-            """Apply a saved scene"""
-            try:
-                scenes = self.bridge.config.get('scenes', [])
-                scene = next((s for s in scenes if s['name'] == scene_name), None)
-                
-                if scene:
-                    self.bridge.effects.apply_scene(scene)
-                    return jsonify({'success': True})
-                return jsonify({'error': 'Scene not found'}), 404
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/controllers', methods=['POST'])
-        def add_controller():
-            """Add a new ESP32 controller"""
-            try:
-                controller_data = request.json
-                
-                # Log controller data with masked secrets
-                safe_data = controller_data.copy()
-                if 'wifi_password' in safe_data:
-                    safe_data['wifi_password'] = '***MASKED***'
-                logger.info(f"📡 Received controller data: {safe_data}")
-                
-                # Auto-generate name if not provided
-                if not controller_data.get('name'):
-                    existing_controllers = self.bridge.config.get('controllers', [])
-                    base_name = 'esp-ble-bridge'
-                    
-                    # Check if base name exists
-                    existing_names = [c.get('name', '').lower() for c in existing_controllers]
-                    if base_name not in existing_names:
-                        controller_data['name'] = base_name
-                    else:
-                        # Find next available number
-                        counter = 1
-                        while f"{base_name}-{counter}" in existing_names:
-                            counter += 1
-                        controller_data['name'] = f"{base_name}-{counter}"
-                    
-                    logger.info(f"🏷️  Auto-generated controller name: {controller_data['name']}")
-                
-                # Generate unique ID
-                controller_id = len(self.bridge.config.get('controllers', [])) + 1
-                controller_data['id'] = controller_id
-                
-                # Handle WiFi secrets for new controllers
-                if controller_data.get('generate_esphome'):
-                    # First ensure secrets.yaml has valid encryption keys
-                    if self.bridge.esphome_generator:
-                        self.bridge.esphome_generator.save_secrets_template()
-                    
-                    network_id = controller_data.pop('network_id', None)
-                    wifi_ssid = controller_data.pop('wifi_ssid', None)
-                    wifi_password = controller_data.pop('wifi_password', None)
-                    
-                    # Update Home Assistant's secrets.yaml
-                    try:
-                        # Only use network_id if it's a valid number >= 0
-                        if network_id is not None and network_id >= 0:
-                            # Using pre-configured network
-                            self._update_ha_secrets(network_id=network_id)
-                            logger.info(f"🔐 Using WiFi network #{network_id} from /config/secrets.yaml")
-                        elif wifi_ssid and wifi_password:
-                            # Using new WiFi credentials
-                            self._update_ha_secrets(wifi_ssid, wifi_password)
-                            logger.info(f"🔐 Updated WiFi credentials in /config/secrets.yaml")
-                        else:
-                            logger.error("No WiFi credentials provided")
-                            return jsonify({'error': 'WiFi credentials are required for new controllers'}), 400
-                    except Exception as e:
-                        logger.error(f"Failed to update secrets: {e}")
-                        return jsonify({'error': f'Failed to save WiFi credentials: {e}'}), 500
-                
-                # Add to both controllers list and config
-                self.bridge.controllers.append(controller_data)
-                self.bridge.save_config()
-                
-                # Generate ESPHome config if requested
-                esphome_path = None
-                if controller_data.get('generate_esphome') and self.bridge.esphome_generator:
-                    # All controllers get all lights in a mesh network
-                    yaml_config = self.bridge.esphome_generator.generate_controller_config(controller_data)
-                    
-                    # Save to file
-                    controller_name = controller_data['name'].lower().replace(' ', '-')
-                    filename = f"{controller_name}.yaml"
-                    filepath = os.path.join('/config/esphome', filename)
-                    
-                    try:
-                        os.makedirs('/config/esphome', exist_ok=True)
-                        with open(filepath, 'w') as f:
-                            f.write(yaml_config)
-                        esphome_path = filepath
-                        # Store esphome_path in controller data
-                        controller_data['esphome_path'] = esphome_path
-                        self.bridge.save_config()  # Save again with esphome_path
-                        logger.info(f"📝 Generated ESPHome config: {filepath}")
-                    except Exception as e:
-                        logger.error(f"Failed to write ESPHome config: {e}")
-                
-                logger.info(f"✅ Controller '{controller_data['name']}' added successfully with ID: {controller_id}")
-                return jsonify({
-                    'success': True, 
-                    'id': controller_id, 
-                    'name': controller_data['name'],
-                    'esphome_path': esphome_path
-                })
-            except Exception as e:
-                logger.error(f"❌ Error adding controller: {str(e)}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/map/satellite')
-        def get_satellite_map():
-            """Get satellite imagery for the property"""
-            try:
-                with open('/data/options.json', 'r') as f:
-                    config = json.load(f)
-                
-                lat = config.get('map_latitude', 0)
-                lon = config.get('map_longitude', 0)
-                zoom = config.get('map_zoom', 19)
-                
-                # Use OpenStreetMap or Google Maps Static API
-                # For now, return a placeholder
-                return jsonify({
-                    'url': f'https://maps.googleapis.com/maps/api/staticmap?center={lat},{lon}&zoom={zoom}&size=800x800&maptype=satellite',
-                    'center': {'lat': lat, 'lon': lon},
-                    'zoom': zoom
-                })
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/scan', methods=['POST'])
-        def scan_for_lights():
-            """Scan BRMesh network for new lights"""
-            try:
-                logger.info("🔍 Scan request received")
-                
-                # Run BLE discovery if available
-                if self.bridge.ble_discovery:
-                    logger.info("📡 Starting BLE discovery (30 second scan)...")
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    new_lights = loop.run_until_complete(
-                        self.bridge.ble_discovery.auto_discover_and_register(duration=30)
-                    )
-                    loop.close()
-                    logger.info(f"✅ Scan complete. Found {len(new_lights)} new lights: {new_lights}")
-                    return jsonify({'lights': new_lights, 'count': len(new_lights)})
-                else:
-                    logger.warning("⚠️ BLE discovery not enabled in bridge")
-                    return jsonify({'error': 'BLE discovery not enabled. Check bluetooth permissions and enable_ble_discovery setting.'}), 400
-            except Exception as e:
-                logger.error(f"❌ Scan error: {str(e)}", exc_info=True)
-                # Provide helpful error message for common Bluetooth issues
-                error_msg = str(e)
-                if 'No such file or directory' in error_msg or 'Errno 2' in error_msg:
-                    error_msg = 'Bluetooth adapter not accessible. Make sure the add-on has bluetooth: true in config and your system has Bluetooth hardware.'
-                return jsonify({'error': error_msg}), 500
-        
-        @app.route('/api/import/app', methods=['POST'])
-        def import_from_app():
-            """Import configuration from BRMesh app"""
-            try:
-                if not self.bridge.app_importer:
-                    return jsonify({'error': 'App importer not available'}), 400
-                
-                # Sync from ADB
-                count = self.bridge.app_importer.sync_device_names_from_app()
-                return jsonify({'success': True, 'devices_updated': count})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/generate', methods=['POST'])
-        def generate_esphome_configs():
-            """Generate ESPHome YAML configurations"""
-            try:
-                if not self.bridge.esphome_generator:
-                    self.bridge.esphome_generator = ESPHomeConfigGenerator(self.bridge)
-                
-                data = request.json or {}
-                # Default to True for API calls (user initiated action via button)
-                force = data.get('force', True)
-                
-                results = self.bridge.esphome_generator.generate_all_configs(force=force)
-                
-                # Count stats
-                created = sum(1 for r in results.values() if r['status'] == 'created')
-                updated = sum(1 for r in results.values() if r['status'] == 'updated')
-                skipped = sum(1 for r in results.values() if r['status'] == 'skipped')
-                available = sum(1 for r in results.values() if r['status'] == 'update_available')
-                manual = sum(1 for r in results.values() if r['status'] == 'manual_override')
-                
-                return jsonify({
-                    'success': True,
-                    'results': results,
-                    'stats': {
-                        'created': created,
-                        'updated': updated,
-                        'skipped': skipped,
-                        'update_available': available,
-                        'manual_override': manual
-                    }
-                })
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/devices')
-        def get_esphome_devices():
-            """Get list of ESPHome devices from /config/esphome/*.yaml"""
-            try:
-                esphome_dir = '/config/esphome'
-                devices = []
-                
-                if os.path.exists(esphome_dir):
-                    for filename in os.listdir(esphome_dir):
-                        if filename.endswith('.yaml') and filename != 'secrets.yaml':
-                            filepath = os.path.join(esphome_dir, filename)
-                            device_name = filename[:-5]  # Remove .yaml extension
-                            
-                            # Try to read the YAML to get device info
-                            try:
-                                with open(filepath, 'r') as f:
-                                    content = f.read()
-                                    # Basic parsing to check if it's a BRMesh controller
-                                    is_brmesh = 'fastcon:' in content
-                                    
-                                devices.append({
-                                    'name': device_name,
-                                    'filename': filename,
-                                    'path': filepath,
-                                    'is_brmesh': is_brmesh
-                                })
-                            except Exception as e:
-                                logger.warning(f"Could not read ESPHome config {filename}: {e}")
-                
-                return jsonify({'devices': devices})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/status/<controller_name>')
-        def get_esphome_status(controller_name):
-            """Get ESPHome device status and firmware version"""
-            try:
-                import socket
-                import requests
-                
-                # Try to resolve mDNS hostname
-                hostname = f"{controller_name}.local"
-                ip = None
-                online = False
-                firmware_version = None
-                
-                try:
-                    ip = socket.gethostbyname(hostname)
-                    # Try to connect to ESPHome web server
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(2)
-                    result = sock.connect_ex((ip, 80))
-                    sock.close()
-                    online = (result == 0)
-                    
-                    # Try to fetch firmware version from ESPHome web server
-                    if online:
-                        try:
-                            # ESPHome web server exposes info at /text_sensor/bridge_firmware_version
-                            # or we can check the main page for version info
-                            resp = requests.get(f'http://{ip}/', timeout=3)
-                            if resp.ok:
-                                # Try to extract version from HTML comment or global var
-                                import re
-                                match = re.search(r'ESP BLE Bridge v([\d.]+)', resp.text)
-                                if match:
-                                    firmware_version = match.group(1)
-                        except:
-                            pass
-                except:
-                    pass
-                
-                # Get expected firmware version from generator
-                expected_version = "1.0.0"  # Default
-                if self.bridge.esphome_generator:
-                    try:
-                        # Extract version from generator constant
-                        import inspect
-                        source = inspect.getsource(self.bridge.esphome_generator.generate_controller_config)
-                        match = re.search(r'BRIDGE_FIRMWARE_VERSION = "([\d.]+)"', source)
-                        if match:
-                            expected_version = match.group(1)
-                    except:
-                        pass
-                
-                return jsonify({
-                    'name': controller_name,
-                    'hostname': hostname,
-                    'ip': ip,
-                    'online': online,
-                    'firmware_version': firmware_version,
-                    'expected_version': expected_version,
-                    'needs_update': firmware_version is not None and firmware_version != expected_version
-                })
-            except Exception as e:
-                logger.error(f"Failed to get ESPHome status: {e}")
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/logs/<controller_name>')
-        def get_esphome_logs(controller_name):
-            """Get recent logs from ESPHome device"""
-            import socket
-            import requests
-            
-            logger.info(f"Fetching logs for controller: {controller_name}")
-            
-            # Try to resolve mDNS hostname
-            hostname = f"{controller_name}.local"
-            try:
-                logger.debug(f"Resolving hostname: {hostname}")
-                ip = socket.gethostbyname(hostname)
-                logger.info(f"Resolved {hostname} to {ip}")
-            except (socket.gaierror, socket.herror, OSError) as e:
-                logger.warning(f"Cannot resolve {hostname}: {type(e).__name__} - {e}")
-                return jsonify({'error': f'Controller {controller_name} is offline or not found on network'}), 404
-            except Exception as e:
-                logger.error(f"Unexpected DNS error for {hostname}: {type(e).__name__} - {e}", exc_info=True)
-                return jsonify({'error': f'Network error: {str(e)}'}), 500
-            
-            # ESPHome's HTTP /logs endpoint is known to be unreliable
-            # It often returns ERR_EMPTY_RESPONSE or closes connections
-            # The proper way is to use ESPHome API (port 6053) but that requires aioesphomeapi
-            
-            # For now, provide a helpful message with alternatives
-            logger.debug(f"ESPHome logs requested for {controller_name} (IP: {ip})")
-            
-            help_message = f"""📋 ESPHome Logs for {controller_name}
+            if light_id not in bridge.lights:
+                return error('Light not found', 404)
+            data = request.get_json(silent=True) or {}
+            bridge.lights[light_id]['location'] = {'x': data.get('x'), 'y': data.get('y')}
+            bridge.save_config()
+            return jsonify({'success': True})
 
-⚠️  Direct HTTP log streaming is not available
-    (ESPHome's /logs endpoint returns ERR_EMPTY_RESPONSE)
-
-📍 Controller Status: ✅ Online at {ip} ({hostname})
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔍 How to View Logs:
-
-Option 1: ESPHome Dashboard (Recommended)
-   1. Go to Settings → Add-ons → ESPHome
-   2. Click "OPEN WEB UI"
-   3. Find "{controller_name}" in the list
-   4. Click the three dots (⋮) → "LOGS"
-   5. Logs will stream in real-time
-
-Option 2: Direct Web Interface
-   Open http://{hostname}/ in your browser
-   (Note: The /logs endpoint doesn't work, but the main page does)
-
-Option 3: Add to Home Assistant
-   1. Settings → Devices & Services → ESPHome
-   2. Add this device using encryption key from secrets.yaml
-   3. View logs through HA's ESPHome integration
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 Technical Note:
-   To implement proper log streaming here, we would need to use
-   ESPHome's Native API (port 6053) with aioesphomeapi library.
-   The HTTP /logs endpoint is unreliable and often fails.
-"""
-            
-            return jsonify({
-                'logs': help_message,
-                'raw': True,
-                'is_placeholder': True
-            })
-        
-        @app.route('/api/esphome/download/<controller_name>')
-        def download_esphome_config(controller_name):
-            """Download ESPHome YAML for a specific controller"""
-            try:
-                if not self.bridge.esphome_generator:
-                    return jsonify({'error': 'ESPHome generator not available'}), 400
-                
-                controller = next((c for c in self.bridge.controllers if c['name'] == controller_name), None)
-                if not controller:
-                    return jsonify({'error': 'Controller not found'}), 404
-                
-                # Generate config (includes all lights for mesh network)
-                yaml_config = self.bridge.esphome_generator.generate_controller_config(controller)
-                
-                return Response(
-                    yaml_config,
-                    mimetype='text/yaml',
-                    headers={'Content-Disposition': f'attachment; filename={controller_name}.yaml'}
-                )
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/build/<controller_name>', methods=['POST'])
-        def build_firmware(controller_name):
-            """Compile firmware for a controller"""
-            try:
-                if not hasattr(self.bridge, 'esphome_builder'):
-                    return jsonify({'error': 'ESPHome builder not available'}), 400
-                
-                logger.info(f"🔨 Starting firmware build for {controller_name}")
-                result = self.bridge.esphome_builder.compile_firmware(controller_name)
-                
-                if result['success']:
-                    return jsonify(result)
-                else:
-                    return jsonify(result), 500
-            except Exception as e:
-                logger.error(f"Build error: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/flash/<controller_name>', methods=['POST'])
-        def flash_firmware(controller_name):
-            """Flash firmware to ESP32"""
-            try:
-                if not hasattr(self.bridge, 'esphome_builder'):
-                    return jsonify({'error': 'ESPHome builder not available'}), 400
-                
-                data = request.json or {}
-                port = data.get('port', 'auto')
-                
-                logger.info(f"⚡ Starting firmware flash for {controller_name} on {port}")
-                result = self.bridge.esphome_builder.flash_firmware(controller_name, port)
-                
-                if result['success']:
-                    return jsonify(result)
-                else:
-                    return jsonify(result), 500
-            except Exception as e:
-                logger.error(f"Flash error: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/esphome/ports', methods=['GET'])
-        def get_serial_ports():
-            """List available serial ports"""
-            try:
-                if not hasattr(self.bridge, 'esphome_builder'):
-                    return jsonify({'error': 'ESPHome builder not available'}), 400
-                
-                ports = self.bridge.esphome_builder.list_serial_ports()
-                return jsonify({'ports': ports})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/nspanel/refresh', methods=['POST'])
-        def refresh_nspanel():
-            """Refresh NSPanel display"""
-            try:
-                if not self.bridge.nspanel_ui:
-                    return jsonify({'error': 'NSPanel UI not enabled'}), 400
-                
-                self.bridge.nspanel_ui.refresh_nspanel_display()
-                return jsonify({'success': True})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/lights/<int:light_id>/reset', methods=['POST'])
-        def factory_reset_light(light_id):
-            """Factory reset a light (clears pairing, returns to pairing mode)"""
-            try:
-                if light_id not in self.bridge.lights:
-                    return jsonify({'error': f'Light {light_id} not found'}), 404
-                
-                logger.info(f"🔄 Factory resetting light {light_id}")
-                success = self.bridge.factory_reset_light(light_id)
-                
-                if success:
-                    return jsonify({
-                        'success': True,
-                        'message': f'Light {light_id} has been factory reset. Power cycle the light to enter pairing mode.'
-                    })
-                else:
-                    return jsonify({'error': 'Failed to send reset command'}), 500
-            except Exception as e:
-                logger.error(f"Reset light error: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
         @app.route('/api/lights/<int:light_id>/unpair', methods=['POST'])
         def unpair_light(light_id):
-            """Remove light from configuration (unregister from Home Assistant)"""
-            try:
-                if light_id not in self.bridge.lights:
-                    return jsonify({'error': f'Light {light_id} not found'}), 404
-                
-                light_name = self.bridge.lights[light_id]['name']
-                logger.info(f"🗑️  Unpairing light {light_id} ({light_name})")
-                
-                # Remove from MQTT discovery
-                self.bridge.unpublish_light_discovery(light_id)
-                
-                # Remove from lights dictionary
-                del self.bridge.lights[light_id]
-                
-                # Remove from config
-                self.bridge.config['lights'] = [
-                    light for light in self.bridge.config.get('lights', [])
-                    if light['light_id'] != light_id
-                ]
-                self.bridge.save_config()
-                
-                # Regenerate ESPHome configs if enabled
-                if self.bridge.esphome_generator and self.bridge.config.get('generate_esphome_configs', True):
-                    self.bridge.esphome_generator.generate_all_configs()
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'Light {light_id} ({light_name}) has been removed from configuration'
-                })
-            except Exception as e:
-                logger.error(f"Unpair light error: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
+            light = bridge.lights.pop(light_id, None)
+            if not light:
+                return error('Light not found', 404)
+            bridge.lights_changed()
+            return jsonify({'success': True, 'message': f"Light {light_id} ({light['name']}) removed. "
+                                                         f"Reinstall the controllers to drop it from the firmware."})
+
+        @app.route('/api/lights/<int:light_id>/reset', methods=['POST'])
+        def factory_reset_light(light_id):
+            return error("Remote factory reset is not supported. Reset a light by switching its power off and on "
+                         "5 times, then pair it again with the BRMesh app.", 501)
+
+        # --- controllers --------------------------------------------------
+
+        @app.route('/api/controllers')
+        def get_controllers():
+            out = []
+            for c in bridge.controllers:
+                info = dict(c)
+                status = bridge.controller_status(c)
+                info.update(online=bool(status['online']), ip=status['ip'] or c.get('ip'),
+                            in_home_assistant=status['in_home_assistant'])
+                info['config_status'] = 'configured' if os.path.exists(bridge.esphome_generator.config_path(c)) else 'no_config'
+                info['light_count'] = len(bridge.esphome_generator.controller_lights(c))
+                info['all_lights'] = c.get('light_ids') is None
+                if info['light_count'] > LIGHTS_PER_CONTROLLER_WARNING:
+                    info['warning'] = (f"{info['light_count']} lights on one ESP32 may run it out of memory; "
+                                       f"assign part of the lights to another controller.")
+                job = bridge.esphome_builder.job(c['name'])
+                info['job'] = job.to_dict() if job else None
+                if info['job']:
+                    info['job'].pop('output', None)
+                out.append(info)
+            return jsonify(out)
+
+        @app.route('/api/controllers', methods=['POST'])
+        def add_controller():
+            data = request.get_json(silent=True) or {}
+            existing = {c['name'].lower() for c in bridge.controllers}
+            name = (data.get('name') or '').strip()
+            if not name:
+                name = 'esp-ble-bridge'
+                n = 1
+                while name in existing:
+                    name = f'esp-ble-bridge-{n}'
+                    n += 1
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _-]{0,30}', name):
+                return error('Controller names may only contain letters, digits, spaces, - and _ (max 31 characters)')
+            if name.lower() in existing:
+                return error(f"A controller named '{name}' already exists")
+
+            controller = {
+                'id': max([int(c.get('id', 0)) for c in bridge.controllers] + [0]) + 1,
+                'name': name,
+                'board': data.get('board') or None,
+                'ip_address': data.get('ip_address') or None,
+                'light_ids': self._clean_light_ids(data.get('light_ids')),
+                'location': {'x': None, 'y': None},
+            }
+            if data.get('generate_esphome', True):
+                network_id = data.get('network_id')
+                secrets = bridge.store.read_secrets()
+                if network_id is not None and int(network_id) >= 0:
+                    ssid = secrets.get(f'wifi_network_{network_id}_ssid')
+                    password = secrets.get(f'wifi_network_{network_id}_password')
+                    if not ssid:
+                        return error(f'WiFi network {network_id} not found')
+                    self._set_active_wifi(ssid, password)
+                elif data.get('wifi_ssid') and data.get('wifi_password'):
+                    self._set_active_wifi(data['wifi_ssid'], data['wifi_password'])
+                elif not secrets.get('wifi_ssid'):
+                    return error('WiFi credentials are required for new controllers')
+
+            bridge.controllers.append(controller)
+            bridge.save_config()
+            path = None
+            if data.get('generate_esphome', True):
+                bridge.esphome_generator.ensure_secrets()
+                bridge.esphome_generator.generate_all_configs(force=False)
+                path = bridge.esphome_generator.config_path(controller)
+                controller['esphome_path'] = path
+                bridge.save_config()
+            return jsonify({'success': True, 'id': controller['id'], 'name': name, 'esphome_path': path})
+
+        @app.route('/api/controllers/<int:controller_id>', methods=['PUT'])
+        def update_controller(controller_id):
+            controller = self._controller(controller_id)
+            if not controller:
+                return error('Controller not found', 404)
+            data = request.get_json(silent=True) or {}
+            for key in ('ip_address', 'mac', 'board'):
+                if key in data:
+                    controller[key] = data[key] or None
+            if 'ip' in data:
+                controller['ip_address'] = data['ip'] or None
+            if 'light_ids' in data:
+                controller['light_ids'] = self._clean_light_ids(data['light_ids'])
+            bridge.save_config()
+            if any(k in data for k in ('board', 'ip_address', 'ip', 'light_ids')):
+                bridge.esphome_generator.generate_all_configs(force=True)
+            return jsonify({'success': True, 'controller': controller})
+
+        @app.route('/api/controllers/<controller_id>/location', methods=['PUT'])
+        def update_controller_location(controller_id):
+            controller = self._controller(controller_id)
+            if not controller:
+                return error('Controller not found', 404)
+            data = request.get_json(silent=True) or {}
+            controller['location'] = {'x': data.get('x'), 'y': data.get('y')}
+            bridge.save_config()
+            return jsonify({'success': True})
+
+        def _remove_controller(controller, delete_yaml):
+            bridge.controllers = [c for c in bridge.controllers if c is not controller]
+            bridge.save_config()
+            path = bridge.esphome_generator.config_path(controller)
+            if delete_yaml and os.path.exists(path):
+                os.remove(path)
+
+        @app.route('/api/controllers/<int:controller_id>', methods=['DELETE'])
+        def delete_controller(controller_id):
+            controller = self._controller(controller_id)
+            if not controller:
+                return error('Controller not found', 404)
+            _remove_controller(controller, delete_yaml=False)
+            return jsonify({'success': True})
+
         @app.route('/api/controllers/<controller_name>/reset', methods=['POST'])
         def reset_controller(controller_name):
-            """Reset controller configuration (clears WiFi, regenerates secrets)"""
+            controller = self._controller(controller_name)
+            if not controller:
+                return error('Controller not found', 404)
+            _remove_controller(controller, delete_yaml=True)
+            return jsonify({'success': True, 'message': f"Controller {controller['name']} removed."})
+
+        @app.route('/api/controllers/<controller_name>/signal')
+        def get_controller_signal(controller_name):
+            # Lamps do not report signal strength to the controller.
+            return jsonify({})
+
+        # --- ESPHome ---------------------------------------------------------
+
+        @app.route('/api/esphome/generate', methods=['POST'])
+        def generate_esphome_configs():
+            data = request.get_json(silent=True) or {}
+            bridge.esphome_generator.install_components()
+            bridge.esphome_generator.ensure_secrets()
+            results = bridge.esphome_generator.generate_all_configs(force=data.get('force', True))
+            stats = {}
+            for r in results.values():
+                stats[r['status']] = stats.get(r['status'], 0) + 1
+            return jsonify({'success': True, 'results': results, 'stats': stats})
+
+        @app.route('/api/esphome/devices')
+        def get_esphome_devices():
+            devices = []
+            esphome_dir = bridge.esphome_generator.config_dir
+            if os.path.isdir(esphome_dir):
+                for filename in sorted(os.listdir(esphome_dir)):
+                    if filename.endswith('.yaml') and filename != 'secrets.yaml':
+                        path = os.path.join(esphome_dir, filename)
+                        try:
+                            with open(path) as f:
+                                is_brmesh = 'fastcon' in f.read()
+                        except OSError:
+                            is_brmesh = False
+                        devices.append({'name': filename[:-5], 'filename': filename, 'path': path, 'is_brmesh': is_brmesh})
+            return jsonify({'devices': devices})
+
+        @app.route('/api/esphome/status/<controller_name>')
+        def get_esphome_status(controller_name):
+            controller = self._controller(controller_name) or {'name': controller_name}
+            status = bridge.controller_status(controller)
+            return jsonify({
+                'name': controller_name,
+                'online': bool(status['online']),
+                'ip': status['ip'],
+                'in_home_assistant': status['in_home_assistant'],
+                'esphome_version': status['esphome_version'],
+                'firmware_version': None,
+                'expected_version': BRIDGE_FIRMWARE_VERSION,
+                'needs_update': False,
+            })
+
+        @app.route('/api/esphome/build-status/<controller_name>')
+        def get_build_status(controller_name):
+            path = bridge.esphome_builder.find_firmware_binary(controller_name)
+            job = bridge.esphome_builder.job(controller_name)
+            return jsonify({'built': bool(path), 'path': path, 'job': job.to_dict() if job else None})
+
+        @app.route('/api/esphome/job/<controller_name>')
+        def get_job(controller_name):
+            job = bridge.esphome_builder.job(controller_name)
+            if not job:
+                return error('No build has been started for this controller', 404)
+            return jsonify(job.to_dict())
+
+        def _start_job(controller_name, action, port='OTA'):
             try:
-                controller = next((c for c in self.bridge.controllers if c['name'] == controller_name), None)
-                if not controller:
-                    return jsonify({'error': 'Controller not found'}), 404
-                
-                logger.info(f"🔄 Resetting controller {controller_name}")
-                
-                # Remove controller from configuration
-                self.bridge.controllers = [c for c in self.bridge.controllers if c['name'] != controller_name]
-                self.bridge.config['controllers'] = self.bridge.controllers
-                self.bridge.save_config()
-                
-                # Remove ESPHome YAML file
-                esphome_path = f'/config/esphome/{controller_name}.yaml'
-                if os.path.exists(esphome_path):
-                    os.remove(esphome_path)
-                    logger.info(f"🗑️  Removed ESPHome config: {esphome_path}")
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'Controller {controller_name} has been reset. You can add it again as a new controller.'
-                })
-            except Exception as e:
-                logger.error(f"Reset controller error: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/system/reset', methods=['POST'])
-        def system_reset():
-            """Full system reset (removes all lights, controllers, scenes, effects - use with caution!)"""
-            try:
-                data = request.json or {}
-                confirm = data.get('confirm', False)
-                
-                if not confirm:
-                    return jsonify({
-                        'error': 'System reset requires confirmation. Set "confirm": true in request body.'
-                    }), 400
-                
-                logger.warning("⚠️  FULL SYSTEM RESET INITIATED")
-                
-                # Remove all MQTT discovery topics
-                for light_id in list(self.bridge.lights.keys()):
-                    self.bridge.unpublish_light_discovery(light_id)
-                
-                # Clear all data
-                self.bridge.lights = {}
-                self.bridge.controllers = []
-                
-                # Reset config to defaults
-                self.bridge.config['lights'] = []
-                self.bridge.config['controllers'] = []
-                self.bridge.config['scenes'] = []
-                self.bridge.config['effects'] = []
-                self.bridge.save_config()
-                
-                # Remove all ESPHome YAML files (except secrets.yaml)
-                esphome_dir = '/config/esphome'
-                if os.path.exists(esphome_dir):
-                    for filename in os.listdir(esphome_dir):
-                        if filename.endswith('.yaml') and filename != 'secrets.yaml':
-                            filepath = os.path.join(esphome_dir, filename)
-                            try:
-                                os.remove(filepath)
-                                logger.info(f"🗑️  Removed {filepath}")
-                            except Exception as e:
-                                logger.warning(f"Could not remove {filepath}: {e}")
-                
-                logger.warning("✅ System reset complete")
-                return jsonify({
-                    'success': True,
-                    'message': 'System has been fully reset. All lights, controllers, scenes, and effects have been removed.'
-                })
-            except Exception as e:
-                logger.error(f"System reset error: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/settings', methods=['GET'])
-        def get_settings():
-            """Get all configuration settings"""
-            try:
-                settings = {
-                    'mesh_key': self.bridge.mesh_key,
-                    'use_addon_mqtt': self.bridge.config.get('use_addon_mqtt', True),
-                    'mqtt_host': self.bridge.config.get('mqtt_host', ''),
-                    'mqtt_port': self.bridge.config.get('mqtt_port', 1883),
-                    'mqtt_user': self.bridge.config.get('mqtt_user', ''),
-                    'mqtt_password': '',  # Don't expose password
-                    'map_enabled': self.bridge.config.get('map_enabled', True),
-                    'latitude': self.bridge.config.get('latitude', 0),
-                    'longitude': self.bridge.config.get('longitude', 0),
-                    'zoom': self.bridge.config.get('zoom', 18),
-                    'discovery_enabled': self.bridge.config.get('discovery_enabled', True),
-                    'generate_esphome': self.bridge.config.get('generate_esphome', True),
-                    'enable_ble': self.bridge.config.get('enable_ble', True),
-                    'enable_nspanel': self.bridge.config.get('enable_nspanel', False),
-                    'nspanel_entity_id': self.bridge.config.get('nspanel_entity_id', ''),
-                    'app_config_path': self.bridge.config.get('app_config_path', '/share/brmesh_export.json')
-                }
-                return jsonify(settings)
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/settings', methods=['POST'])
-        def update_settings():
-            """Update configuration settings"""
-            try:
-                settings = request.json
-                
-                # Update add-on options file
-                options_path = '/data/options.json'
-                with open(options_path, 'r') as f:
-                    options = json.load(f)
-                
-                # Update all settings
-                mesh_key = settings.get('mesh_key', options.get('mesh_key', ''))
-                options['mesh_key'] = mesh_key
-                options['use_addon_mqtt'] = settings.get('use_addon_mqtt', True)
-                
-                if not options['use_addon_mqtt']:
-                    options['mqtt_host'] = settings.get('mqtt_host', '')
-                    options['mqtt_port'] = settings.get('mqtt_port', 1883)
-                    options['mqtt_user'] = settings.get('mqtt_user', '')
-                    if settings.get('mqtt_password'):  # Only update if provided
-                        options['mqtt_password'] = settings.get('mqtt_password')
-                
-                options['map_enabled'] = settings.get('map_enabled', True)
-                options['map_latitude'] = settings.get('latitude', 0)
-                options['map_longitude'] = settings.get('longitude', 0)
-                options['map_zoom'] = settings.get('zoom', 18)
-                options['discovery_enabled'] = settings.get('discovery_enabled', True)
-                options['generate_esphome'] = settings.get('generate_esphome', True)
-                options['enable_ble'] = settings.get('enable_ble', True)
-                options['enable_nspanel'] = settings.get('enable_nspanel', False)
-                options['nspanel_entity_id'] = settings.get('nspanel_entity_id', '')
-                options['app_config_path'] = settings.get('app_config_path', '/share/brmesh_export.json')
-                
-                # Save updated options
-                with open(options_path, 'w') as f:
-                    json.dump(options, f, indent=2)
-                
-                # Update runtime config immediately (so it persists when save_config() is called)
-                self.bridge.config.update(options)
-                self.bridge.mesh_key = mesh_key
-                logger.info(f"🔑 Updated mesh key: {self.bridge.mesh_key}")
-                
-                # Also save mesh_key to secrets.yaml for ESPHome configs
-                if mesh_key:
-                    try:
-                        from ruamel.yaml import YAML
-                        from ruamel.yaml.scalarstring import PlainScalarString
-                        yaml = YAML()
-                        yaml.preserve_quotes = True
-                        yaml.default_flow_style = False
-                        
-                        secrets_path = '/config/secrets.yaml'
-                        secrets = {}
-                        
-                        # Load existing secrets if file exists
-                        if os.path.exists(secrets_path):
-                            try:
-                                with open(secrets_path, 'r') as f:
-                                    secrets = yaml.load(f) or {}
-                            except Exception as e:
-                                logger.warning(f"Could not read existing secrets.yaml: {e}")
-                        
-                        # Update mesh_key in secrets (use PlainScalarString to avoid quotes)
-                        secrets['mesh_key'] = PlainScalarString(mesh_key)
-                        
-                        # Save back to file (preserving comments)
-                        with open(secrets_path, 'w') as f:
-                            yaml.dump(secrets, f)
-                        
-                        logger.info(f"✅ Saved mesh key to /config/secrets.yaml")
-                    except Exception as e:
-                        logger.error(f"Failed to save mesh key to secrets.yaml: {e}")
-                
-                # Save to ensure mesh_key is persisted in the lights/controllers config
-                self.bridge.save_config()
-                
-                return jsonify({'success': True, 'message': 'Settings saved. Please restart the add-on.'})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/settings/reset', methods=['POST'])
-        def reset_settings():
-            """Reset settings to defaults"""
-            try:
-                default_settings = {
-                    'mesh_key': '',
-                    'use_addon_mqtt': True,
-                    'map_enabled': True,
-                    'latitude': 0,
-                    'longitude': 0,
-                    'zoom': 18,
-                    'discovery_enabled': True,
-                    'generate_esphome': True,
-                    'enable_ble': True,
-                    'enable_nspanel': False,
-                    'controllers': [],
-                    'lights': {},
-                    'scenes': []
-                }
-                
-                options_path = '/data/options.json'
-                with open(options_path, 'w') as f:
-                    json.dump(default_settings, f, indent=2)
-                
-                return jsonify({'success': True, 'message': 'Settings reset to defaults. Restart the add-on.'})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/wifi-networks', methods=['GET'])
-        def get_wifi_networks():
-            """Get list of configured WiFi networks (SSIDs only, not passwords)"""
-            try:
-                from ruamel.yaml import YAML
-                yaml = YAML()
-                yaml.preserve_quotes = True
-                yaml.default_flow_style = False
-                
-                secrets_path = '/config/secrets.yaml'
-                
-                if not os.path.exists(secrets_path):
-                    return jsonify({'networks': []})
-                
-                with open(secrets_path, 'r') as f:
-                    secrets = yaml.load(f) or {}
-                
-                # Get default network ID (0 if not set)
-                default_network_id = secrets.get('default_wifi_network', 0)
-                
-                # Get all wifi network SSIDs (stored as wifi_network_0, wifi_network_1, etc.)
-                networks = []
-                i = 0
-                while f'wifi_network_{i}_ssid' in secrets:
-                    networks.append({
-                        'id': i,
-                        'ssid': secrets[f'wifi_network_{i}_ssid'],
-                        'is_default': (i == default_network_id)
-                    })
-                    i += 1
-                
-                # If only one network, automatically make it default
-                if len(networks) == 1:
-                    networks[0]['is_default'] = True
-                
-                # Also check for legacy wifi_ssid
-                if 'wifi_ssid' in secrets and not networks:
-                    networks.append({
-                        'id': -1,  # Legacy entry
-                        'ssid': secrets['wifi_ssid']
-                    })
-                
-                return jsonify({'networks': networks})
-            except Exception as e:
-                logger.error(f"Failed to get WiFi networks: {e}")
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/wifi-networks', methods=['POST'])
-        def add_wifi_network():
-            """Add a new WiFi network"""
-            try:
-                from ruamel.yaml import YAML
-                from ruamel.yaml.scalarstring import PlainScalarString
-                yaml = YAML()
-                yaml.preserve_quotes = True
-                yaml.default_flow_style = False
-                
-                data = request.json
-                ssid = data.get('ssid')
-                password = data.get('password')
-                
-                if not ssid or not password:
-                    return jsonify({'error': 'SSID and password required'}), 400
-                
-                secrets_path = '/config/secrets.yaml'
-                secrets = {}
-                
-                logger.info(f"📁 Checking secrets file at: {secrets_path}")
-                logger.info(f"📁 File exists: {os.path.exists(secrets_path)}")
-                
-                if os.path.exists(secrets_path):
-                    with open(secrets_path, 'r') as f:
-                        secrets = yaml.load(f) or {}
-                    logger.info(f"📖 Loaded {len(secrets)} existing secrets")
-                else:
-                    logger.info(f"📝 Creating new secrets.yaml file")
-                
-                # Find next available ID
-                i = 0
-                while f'wifi_network_{i}_ssid' in secrets:
-                    i += 1
-                
-                # Add new network (use PlainScalarString to avoid quotes)
-                secrets[f'wifi_network_{i}_ssid'] = PlainScalarString(ssid)
-                secrets[f'wifi_network_{i}_password'] = PlainScalarString(password)
-                
-                logger.info(f"💾 Saving network with ID {i}: {ssid}")
-                logger.info(f"💾 Total secrets to save: {len(secrets)}")
-                
-                # Save with explicit permissions (preserving comments)
-                yaml_handler = self._get_yaml_handler()
-                with open(secrets_path, 'w') as f:
-                    yaml_handler.dump(secrets, f)
-                
-                # Verify it was written
-                if os.path.exists(secrets_path):
-                    with open(secrets_path, 'r') as f:
-                        verify = yaml.load(f) or {}
-                    logger.info(f"✅ Verified: File contains {len(verify)} secrets after save")
-                    if f'wifi_network_{i}_ssid' in verify:
-                        logger.info(f"✅ Added WiFi network: {ssid} (ID: {i})")
-                    else:
-                        logger.error(f"❌ Network not found in file after save!")
-                else:
-                    logger.error(f"❌ secrets.yaml not found after save!")
-                
-                return jsonify({'success': True, 'id': i, 'ssid': ssid})
-            except Exception as e:
-                logger.error(f"Failed to add WiFi network: {e}", exc_info=True)
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/wifi-networks/<int:network_id>', methods=['DELETE'])
-        def delete_wifi_network(network_id):
-            """Delete a WiFi network and reindex remaining networks"""
-            try:
-                # Prevent deletion of legacy network ID
-                if network_id < 0:
-                    return jsonify({'error': 'Cannot delete legacy WiFi network. This is a read-only entry from wifi_ssid/wifi_password.'}), 400
-                
-                from ruamel.yaml import YAML
-                from ruamel.yaml.scalarstring import PlainScalarString
-                yaml = YAML()
-                yaml.preserve_quotes = True
-                yaml.default_flow_style = False
-                
-                secrets_path = '/config/secrets.yaml'
-                
-                if not os.path.exists(secrets_path):
-                    return jsonify({'error': 'No WiFi networks configured'}), 404
-                
-                with open(secrets_path, 'r') as f:
-                    secrets = yaml.load(f) or {}
-                
-                # Check if network exists
-                ssid_key = f'wifi_network_{network_id}_ssid'
-                pass_key = f'wifi_network_{network_id}_password'
-                
-                if ssid_key not in secrets:
-                    return jsonify({'error': 'Network not found'}), 404
-                
-                ssid = secrets[ssid_key]
-                
-                # Collect all existing networks
-                networks = []
-                i = 0
-                while f'wifi_network_{i}_ssid' in secrets:
-                    if i != network_id:  # Skip the one being deleted
-                        networks.append({
-                            'ssid': secrets[f'wifi_network_{i}_ssid'],
-                            'password': secrets[f'wifi_network_{i}_password']
-                        })
-                    # Remove old keys
-                    secrets.pop(f'wifi_network_{i}_ssid', None)
-                    secrets.pop(f'wifi_network_{i}_password', None)
-                    i += 1
-                
-                # Re-add networks with sequential IDs starting from 0 (use PlainScalarString)
-                for idx, network in enumerate(networks):
-                    secrets[f'wifi_network_{idx}_ssid'] = PlainScalarString(str(network['ssid']))
-                    secrets[f'wifi_network_{idx}_password'] = PlainScalarString(str(network['password']))
-                
-                # Save (preserving comments)
-                yaml_handler = self._get_yaml_handler()
-                with open(secrets_path, 'w') as f:
-                    yaml_handler.dump(secrets, f)
-                
-                logger.info(f"🗑️  Deleted WiFi network: {ssid} (reindexed {len(networks)} remaining networks)")
-                return jsonify({'success': True})
-            except Exception as e:
-                logger.error(f"Failed to delete WiFi network: {e}")
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/wifi-networks/<int:network_id>/set-default', methods=['POST'])
-        def set_default_wifi_network(network_id):
-            """Set a WiFi network as the default"""
-            try:
-                from ruamel.yaml import YAML
-                from ruamel.yaml.scalarstring import PlainScalarString
-                yaml = YAML()
-                yaml.preserve_quotes = True
-                yaml.default_flow_style = False
-                
-                secrets_path = '/config/secrets.yaml'
-                
-                if not os.path.exists(secrets_path):
-                    return jsonify({'error': 'No WiFi networks configured'}), 404
-                
-                with open(secrets_path, 'r') as f:
-                    secrets = yaml.load(f) or {}
-                
-                # Verify network exists
-                if f'wifi_network_{network_id}_ssid' not in secrets:
-                    return jsonify({'error': 'Network not found'}), 404
-                
-                # Set default
-                secrets['default_wifi_network'] = PlainScalarString(str(network_id))
-                
-                # Save
-                yaml_handler = self._get_yaml_handler()
-                with open(secrets_path, 'w') as f:
-                    yaml_handler.dump(secrets, f)
-                
-                logger.info(f"✅ Set WiFi network {network_id} as default")
-                return jsonify({'success': True})
-            except Exception as e:
-                logger.error(f"Failed to set default WiFi network: {e}")
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/settings/import-app', methods=['POST'])
-        def import_from_app_settings():
-            """Import configuration from BRMesh app (via settings)"""
-            try:
-                if not self.bridge.app_importer:
-                    return jsonify({'error': 'App importer not available'}), 400
-                
-                app_config_path = self.bridge.config.get('app_config_path', '/share/brmesh_export.json')
-                
-                # Try JSON import first if file exists
-                if os.path.exists(app_config_path):
-                    result = self.bridge.app_importer.import_from_json_export(app_config_path)
-                    if result:
-                        return jsonify({
-                            'success': True,
-                            'lights_imported': len(result.get('lights', [])),
-                            'mesh_key': result.get('mesh_key', ''),
-                            'method': 'json'
-                        })
-                
-                # Fall back to ADB logcat
-                count = self.bridge.app_importer.sync_device_names_from_app()
-                return jsonify({
-                    'success': True,
-                    'lights_imported': count,
-                    'method': 'adb'
-                })
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/diagnostics/git-test', methods=['GET'])
-        def test_git_connectivity():
-            """Test git and GitHub connectivity"""
-            try:
-                import subprocess
-                
-                results = {}
-                
-                # Test 1: Git version
-                try:
-                    git_version = subprocess.run(
-                        ['git', '--version'],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    results['git_version'] = git_version.stdout.strip() if git_version.returncode == 0 else f"Error: {git_version.stderr}"
-                except Exception as e:
-                    results['git_version'] = f"Error: {str(e)}"
-                
-                # Test 2: Git config
-                try:
-                    git_config = subprocess.run(
-                        ['git', 'config', '--list'],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    results['git_config'] = git_config.stdout if git_config.returncode == 0 else f"Error: {git_config.stderr}"
-                except Exception as e:
-                    results['git_config'] = f"Error: {str(e)}"
-                
-                # Test 3: DNS resolution for github.com
-                try:
-                    dns_test = subprocess.run(
-                        ['nslookup', 'github.com'],
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
-                    results['dns_github'] = dns_test.stdout if dns_test.returncode == 0 else f"Error: {dns_test.stderr}"
-                except Exception as e:
-                    results['dns_github'] = f"Error: {str(e)}"
-                
-                # Test 4: Try to clone the repo (shallow clone)
-                try:
-                    import tempfile
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        clone_test = subprocess.run(
-                            ['git', 'clone', '--depth', '1', 'https://github.com/scross01/esphome-fastcon.git', tmpdir],
-                            capture_output=True,
-                            text=True,
-                            timeout=60
-                        )
-                        results['clone_test'] = {
-                            'success': clone_test.returncode == 0,
-                            'stdout': clone_test.stdout,
-                            'stderr': clone_test.stderr,
-                            'returncode': clone_test.returncode
-                        }
-                except Exception as e:
-                    results['clone_test'] = f"Error: {str(e)}"
-                
-                return jsonify(results)
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/diagnostics/secrets-check', methods=['GET'])
-        def check_secrets():
-            """Check secrets.yaml for encryption key validity"""
-            try:
-                from ruamel.yaml import YAML
-                yaml = YAML()
-                yaml.preserve_quotes = True
-                yaml.default_flow_style = False
-                secrets_path = '/config/secrets.yaml'
-                
-                if not os.path.exists(secrets_path):
-                    return jsonify({'error': 'secrets.yaml not found'}), 404
-                
-                with open(secrets_path, 'r') as f:
-                    content = f.read()
-                    secrets = yaml.load(content)
-                
-                api_key = secrets.get('api_encryption_key', '')
-                ota_pass = secrets.get('ota_password', '')
-                
-                # Find the raw line in the file
-                api_key_line = ''
-                for line in content.split('\n'):
-                    if line.startswith('api_encryption_key:'):
-                        api_key_line = line
-                        break
-                
-                return jsonify({
-                    'api_key_value': api_key,
-                    'api_key_length': len(api_key),
-                    'api_key_raw_line': api_key_line,
-                    'ota_password': ota_pass[:10] + '...' if len(ota_pass) > 10 else ota_pass,
-                    'total_secrets': len(secrets)
-                })
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
+                job = bridge.esphome_builder.start(controller_name, action, port)
+            except (RuntimeError, FileNotFoundError) as e:
+                return error(str(e), 409)
+            return jsonify({'success': True, 'started': True, 'job': job.to_dict()})
+
+        @app.route('/api/esphome/build/<controller_name>', methods=['POST'])
+        def build_firmware(controller_name):
+            return _start_job(controller_name, 'compile')
+
+        @app.route('/api/esphome/flash/<controller_name>', methods=['POST'])
+        def flash_firmware(controller_name):
+            data = request.get_json(silent=True) or {}
+            port = data.get('port') or 'OTA'
+            action = 'upload' if bridge.esphome_builder.find_firmware_binary(controller_name) and not data.get('rebuild') else 'compile_upload'
+            return _start_job(controller_name, action, port)
+
+        @app.route('/api/esphome/install/<controller_name>', methods=['POST'])
+        def install_firmware(controller_name):
+            data = request.get_json(silent=True) or {}
+            return _start_job(controller_name, 'compile_upload', data.get('port') or 'OTA')
+
+        @app.route('/api/esphome/ports')
+        def get_serial_ports():
+            return jsonify({'ports': bridge.esphome_builder.list_serial_ports()})
+
+        @app.route('/api/esphome/logs/<controller_name>')
+        def get_esphome_logs(controller_name):
+            job = bridge.esphome_builder.job(controller_name)
+            if job:
+                return jsonify({'logs': job.to_dict()['output'], 'raw': True, 'job': job.to_dict()})
+            return jsonify({'logs': f"No build output yet for {controller_name}.\n\n"
+                                    "Live device logs: open the ESPHome dashboard (Settings → Add-ons → ESPHome → "
+                                    "Open Web UI) and choose LOGS on this device.",
+                            'raw': True, 'is_placeholder': True})
+
+        @app.route('/api/esphome/download/<controller_name>')
+        def download_esphome_config(controller_name):
+            controller = self._controller(controller_name)
+            if not controller:
+                return error('Controller not found', 404)
+            content = bridge.esphome_generator.generate_controller_config(controller)
+            return Response(content, mimetype='text/yaml',
+                            headers={'Content-Disposition': f'attachment; filename={controller_slug(controller["name"])}.yaml'})
+
         @app.route('/api/diagnostics/esphome-config/<controller_name>')
         def get_esphome_config(controller_name):
-            """Get raw ESPHome config to debug formatting"""
-            try:
-                config_path = f'/config/esphome/{controller_name}.yaml'
-                if not os.path.exists(config_path):
-                    return jsonify({'error': f'Config not found: {config_path}'}), 404
-                
-                with open(config_path, 'r') as f:
-                    content = f.read()
-                
-                # Return relevant lines around api section
-                lines = content.split('\n')
-                result_lines = []
-                for i, line in enumerate(lines):
-                    if 'api:' in line or 'encryption' in line or 'key:' in line or '!secret' in line:
-                        start = max(0, i - 2)
-                        end = min(len(lines), i + 3)
-                        result_lines.extend(lines[start:end])
-                
-                return jsonify({
-                    'full_config': content,
-                    'api_section': '\n'.join(result_lines),
-                    'file_path': config_path
-                })
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/diagnostics/secrets-raw')
-        def get_secrets_raw():
-            """Get raw secrets.yaml content to debug formatting issues"""
-            try:
-                ha_secrets_path = '/config/secrets.yaml'
-                esphome_secrets_path = '/config/esphome/secrets.yaml'
-                
-                result = {}
-                
-                # Check HA secrets
-                if os.path.exists(ha_secrets_path):
-                    with open(ha_secrets_path, 'r') as f:
-                        content = f.read()
-                    lines = content.split('\n')
-                    result_lines = []
-                    for i, line in enumerate(lines):
-                        if 'api_encryption_key' in line or 'ota_password' in line:
-                            start = max(0, i - 1)
-                            end = min(len(lines), i + 2)
-                            result_lines.extend(lines[start:end])
-                    result['ha_secrets'] = {
-                        'relevant_lines': '\n'.join(result_lines),
-                        'file_size': len(content),
-                        'total_lines': len(lines)
-                    }
-                else:
-                    result['ha_secrets'] = {'error': 'Not found'}
-                
-                # Check ESPHome secrets
-                if os.path.exists(esphome_secrets_path):
-                    with open(esphome_secrets_path, 'r') as f:
-                        content = f.read()
-                    lines = content.split('\n')
-                    result_lines = []
-                    for i, line in enumerate(lines):
-                        if 'api_encryption_key' in line or 'ota_password' in line:
-                            start = max(0, i - 1)
-                            end = min(len(lines), i + 2)
-                            result_lines.extend(lines[start:end])
-                    result['esphome_secrets'] = {
-                        'relevant_lines': '\n'.join(result_lines),
-                        'file_size': len(content),
-                        'total_lines': len(lines)
-                    }
-                else:
-                    result['esphome_secrets'] = {'error': 'Not found'}
-                
-                return jsonify(result)
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/settings/export')
-        def export_settings():
-            """Export complete configuration as JSON"""
-            try:
-                config_data = {
-                    'mesh_key': self.bridge.mesh_key,
-                    'controllers': self.bridge.controllers,
-                    'lights': self.bridge.lights,
-                    'scenes': self.bridge.config.get('scenes', []),
-                    'settings': {
-                        'mqtt_host': self.bridge.config.get('mqtt_host', ''),
-                        'mqtt_port': self.bridge.config.get('mqtt_port', 1883),
-                        'latitude': self.bridge.config.get('latitude', 0),
-                        'longitude': self.bridge.config.get('longitude', 0),
-                        'zoom': self.bridge.config.get('zoom', 18)
-                    }
-                }
-                
-                return Response(
-                    json.dumps(config_data, indent=2),
-                    mimetype='application/json',
-                    headers={'Content-Disposition': 'attachment; filename=brmesh_config.json'}
-                )
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/pairing/ignore', methods=['POST'])
-        def ignore_device():
-            """Add a device to the ignored list"""
-            try:
-                data = request.json
-                mac = data.get('mac')
-                if not mac:
-                    return jsonify({'error': 'MAC address required'}), 400
-                
-                if 'ignored_devices' not in self.bridge.config:
-                    self.bridge.config['ignored_devices'] = []
-                
-                if mac not in self.bridge.config['ignored_devices']:
-                    self.bridge.config['ignored_devices'].append(mac)
-                    self.bridge.save_config()
-                
-                return jsonify({'success': True, 'ignored_devices': self.bridge.config['ignored_devices']})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+            controller = self._controller(controller_name)
+            if not controller:
+                return error('Controller not found', 404)
+            path = bridge.esphome_generator.config_path(controller)
+            if not os.path.exists(path):
+                return error(f'Config not found: {path}', 404)
+            with open(path) as f:
+                return jsonify({'full_config': f.read(), 'file_path': path})
 
-        @app.route('/api/pairing/ignore', methods=['DELETE'])
-        def unignore_device():
-            """Remove a device from the ignored list"""
-            try:
-                data = request.json
-                mac = data.get('mac')
-                if not mac:
-                    return jsonify({'error': 'MAC address required'}), 400
-                
-                if 'ignored_devices' in self.bridge.config:
-                    if mac in self.bridge.config['ignored_devices']:
-                        self.bridge.config['ignored_devices'].remove(mac)
-                        self.bridge.save_config()
-                
-                return jsonify({'success': True, 'ignored_devices': self.bridge.config.get('ignored_devices', [])})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+        @app.route('/api/diagnostics/secrets-check')
+        def check_secrets():
+            secrets = bridge.store.read_secrets()
+            needed = ['wifi_ssid', 'wifi_password', 'api_encryption_key', 'ota_password', 'mesh_key']
+            return jsonify({'missing': [k for k in needed if not secrets.get(k)],
+                            'api_key_valid': bridge.esphome_generator._is_valid_api_key(str(secrets.get('api_encryption_key', ''))),
+                            'mesh_key_matches': str(secrets.get('mesh_key', '')).lower() == bridge.mesh_key})
 
-        @app.route('/api/pairing/discover', methods=['GET'])
-        def discover_unpaired_devices():
-            """Discover BRMesh devices in pairing mode with progress updates"""
-            
-            def generate_progress():
-                """Generator for SSE progress updates"""
-                import json
-                
-                def send_event(event_type, data):
-                    """Send SSE event"""
-                    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-                
-                try:
-                    if not self.bridge.ble_discovery:
-                        yield send_event('error', {'message': 'BLE discovery not enabled'})
-                        return
-                    
-                    yield send_event('status', {'message': 'Initializing BLE scan...', 'progress': 0})
-                    
-                    controllers = self.bridge.config.get('controllers', [])
-                    if not controllers:
-                        yield send_event('error', {'message': 'No ESP32 controllers configured'})
-                        return
-                    
-                    controller = controllers[0]
-                    controller_name = controller.get('name', 'unknown')
-                    yield send_event('status', {'message': f'Using controller: {controller_name}', 'progress': 10})
-                    
-                    # Run async BLE scan with progress updates
-                    import asyncio
-                    try:
-                        yield send_event('status', {'message': 'Starting 15-second BLE scan on ESP32...', 'progress': 20})
-                        
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        
-                        # Create a task to track progress
-                        scan_duration = 15
-                        import time
-                        start_time = time.time()
-                        
-                        # Start scan in background
-                        scan_task = loop.create_task(self.bridge.ble_discovery.scan_for_devices(duration=scan_duration))
-                        
-                        # Send progress updates while scanning
-                        while not scan_task.done():
-                            elapsed = time.time() - start_time
-                            progress = min(90, 20 + int((elapsed / scan_duration) * 70))
-                            yield send_event('status', {
-                                'message': f'Scanning... ({int(elapsed)}/{scan_duration}s)',
-                                'progress': progress
-                            })
-                            time.sleep(1)
-                        
-                        devices = scan_task.result()
-                        loop.close()
-                        
-                        yield send_event('status', {'message': f'Scan complete. Processing {len(devices)} devices...', 'progress': 95})
-                        
-                    except Exception as scan_error:
-                        logger.error(f"BLE scan failed: {scan_error}", exc_info=True)
-                        yield send_event('error', {'message': f'BLE scan failed: {str(scan_error)}'})
-                        return
-                    
-                    # Get ignored devices list
-                    ignored_list = self.bridge.config.get('ignored_devices', [])
-                    
-                    # Format for frontend - return ALL devices but mark status
-                    processed_devices = []
-                    for d in devices:
-                        is_ignored = d['mac_address'] in ignored_list
-                        is_pairable = d.get('pairing_mode', False)
-                        
-                        processed_devices.append({
-                            'mac': d['mac_address'],
-                            'rssi': d['rssi'],
-                            'name': d['name'],
-                            'manufacturer_id': d.get('manufacturer_id'),
-                            'manufacturer': d.get('manufacturer', 'Unknown'),
-                            'pairing_mode': is_pairable,
-                            'ignored': is_ignored,
-                            'raw_data': d.get('manufacturer_data', {}).get('hex', '')
-                        })
-                    
-                    # Sort: Pairable first, then by RSSI
-                    processed_devices.sort(key=lambda x: (not x['pairing_mode'], -x['rssi']))
-                    
-                    logger.info(f"Found {len(processed_devices)} devices total")
-                    
-                    # Send final result
-                    yield send_event('complete', {
-                        'devices': processed_devices,
-                        'count': len(processed_devices),
-                        'progress': 100
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Error discovering unpaired devices: {e}", exc_info=True)
-                    yield send_event('error', {'message': str(e)})
-            
-            # Check if client wants SSE or regular JSON
-            if request.headers.get('Accept') == 'text/event-stream':
-                return Response(generate_progress(), mimetype='text/event-stream')
+        # --- import ----------------------------------------------------------
+
+        @app.route('/api/import/upload', methods=['POST'])
+        def import_upload():
+            """Parse (and optionally apply) a BRMesh app export uploaded from the browser.
+
+            multipart/form-data with `file`, or JSON {"text": "..."} for a pasted share code.
+            Query/form `apply=1` applies it; otherwise only a preview is returned.
+            """
+            content = None
+            if 'file' in request.files:
+                content = request.files['file'].read()
             else:
-                # Fallback: regular JSON response (blocking)
-                try:
-                    if not self.bridge.ble_discovery:
-                        return jsonify({'error': 'BLE discovery not enabled'}), 400
-                    
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    devices = loop.run_until_complete(
-                        self.bridge.ble_discovery.scan_for_devices(duration=15)
-                    )
-                    loop.close()
-                    
-                    ignored_list = self.bridge.config.get('ignored_devices', [])
-                    
-                    processed_devices = []
-                    for d in devices:
-                        processed_devices.append({
-                            'mac': d['mac_address'],
-                            'rssi': d['rssi'],
-                            'name': d['name'],
-                            'manufacturer': d.get('manufacturer', 'Unknown'),
-                            'pairing_mode': d.get('pairing_mode', False),
-                            'ignored': d['mac_address'] in ignored_list
-                        })
-                    
-                    return jsonify(processed_devices)
-                except Exception as e:
-                    logger.error(f"Error: {e}", exc_info=True)
-                    return jsonify({'error': str(e)}), 500
-        
+                body = request.get_json(silent=True) or {}
+                content = body.get('text') or request.form.get('text')
+            if not content:
+                return error('No file or text received')
+            try:
+                parsed = parse_export(content)
+            except ExportError as e:
+                return error(str(e))
+
+            options = {**request.args, **request.form}
+            if options.get('mesh'):
+                parsed = select_mesh(parsed, options['mesh'])
+            existing = set(bridge.lights)
+            preview = {
+                'source': parsed['source'],
+                'mesh_id': parsed['mesh_id'],
+                'meshes': [{'id': m['id'], 'label': m['label'], 'lights': len(m['lights']),
+                            'mesh_key_masked': mask_key(m['mesh_key'])} for m in parsed['meshes']],
+                'mesh_key_found': bool(parsed['mesh_key']),
+                'mesh_key_masked': mask_key(parsed['mesh_key']),
+                'mesh_key_differs': bool(parsed['mesh_key'] and bridge.mesh_key and parsed['mesh_key'] != bridge.mesh_key),
+                'lights': [{**l, 'exists': l['light_id'] in existing} for l in parsed['lights']],
+                'skipped': [{'light_id': d.get('light_id'), 'name': d.get('name'), 'reason': d['skip_reason']}
+                            for d in parsed.get('skipped', [])],
+                'groups': parsed['groups'],
+            }
+            if str(options.get('apply', '0')) not in ('1', 'true', 'yes'):
+                return jsonify({'success': True, 'applied': False, 'preview': preview})
+
+            result = bridge.apply_import(
+                parsed,
+                replace=str(options.get('replace', '0')) in ('1', 'true', 'yes'),
+                update_names=str(options.get('update_names', '1')) in ('1', 'true', 'yes'),
+            )
+            return jsonify({'success': True, 'applied': True, 'preview': preview, 'result': result,
+                            'needs_install': bool(bridge.controllers)})
+
+        @app.route('/api/import/app', methods=['POST'])
+        @app.route('/api/settings/import-app', methods=['POST'])
+        def import_from_app_legacy():
+            return error('Upload the export file from the BRMesh app with "Import from BRMesh App".', 400)
+
+        @app.route('/api/scan', methods=['POST'])
+        @app.route('/api/pairing/discover', methods=['GET'])
+        def scan_for_lights():
+            return error(PAIRING_UNSUPPORTED, 501)
+
         @app.route('/api/pairing/pair', methods=['POST'])
         def pair_device():
-            """Pair a BRMesh device
-            
-            Expected POST data:
-            {
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "address": 1,
-                "group_id": 1,
-                "mesh_key": "30323336"
-            }
-            """
-            try:
-                data = request.json
-                mac = data.get('mac')
-                address = data.get('address', 1)
-                group_id = data.get('group_id', 1)
-                mesh_key = data.get('mesh_key')
-                
-                if not mac:
-                    return jsonify({'error': 'MAC address is required'}), 400
-                
-                # Get mesh key from config if not provided
-                if not mesh_key:
-                    mesh_key = self.bridge.config.get('mesh_key', '30323336')
-                
-                # Convert mesh key string to bytes
-                if isinstance(mesh_key, str):
-                    mesh_key_bytes = bytes.fromhex(mesh_key) if len(mesh_key) == 8 else mesh_key.encode('utf-8')
-                else:
-                    mesh_key_bytes = mesh_key
-                
-                # Generate pairing response
-                pairing_response = create_pairing_response(
-                    device_mac=mac,
-                    address=address,
-                    group_id=group_id,
-                    mesh_key=mesh_key_bytes
-                )
-                
-                logger.info(f"Generated pairing response for {mac}: {pairing_response.hex()}")
-                
-                # Send pairing command via ESP32 controller
-                controllers = self.bridge.config.get('controllers', [])
-                if controllers:
-                    controller = controllers[0]
-                    esp32_host = controller.get('host', controller.get('name', 'esp-ble-bridge') + '.local')
-                    
-                    try:
-                        # Call ESPHome API to trigger pairing action
-                        # Use the button entity that triggers fastcon.pair_device
-                        import requests
-                        import socket
-                        
-                        # Resolve hostname
-                        try:
-                            ip = socket.gethostbyname(esp32_host)
-                        except:
-                            ip = esp32_host
-                        
-                        # ESPHome exposes button press via HTTP API
-                        button_url = f'http://{ip}/button/pair_light_id_{address}'
-                        logger.info(f"Triggering pairing via {button_url}")
-                        
-                        resp = requests.post(button_url, timeout=5)
-                        if resp.ok:
-                            logger.info(f"✅ Pairing command sent to ESP32 for Light ID {address}")
-                        else:
-                            logger.warning(f"ESP32 returned status {resp.status_code}")
-                    except Exception as esp_error:
-                        logger.error(f"Failed to send pairing to ESP32: {esp_error}")
-                        # Continue anyway - pairing response generated
-                
-                # Add device to lights config
-                light_config = {
-                    'id': len(self.bridge.config.get('lights', [])) + 1,
-                    'address': address,
-                    'name': f'Light {address}',
-                    'mac': mac,
-                    'group_id': group_id,
-                    'paired': True
-                }
-                
-                if 'lights' not in self.bridge.config:
-                    self.bridge.config['lights'] = []
-                self.bridge.config['lights'].append(light_config)
-                self.bridge.save_config()
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'Device {mac} paired successfully',
-                    'pairing_response': pairing_response.hex(),
-                    'light': light_config
-                })
-                
-            except Exception as e:
-                logger.error(f"Error pairing device: {e}")
-                return jsonify({'error': str(e)}), 500
-        
+            return error(PAIRING_UNSUPPORTED, 501)
+
+        @app.route('/api/pairing/ignore', methods=['POST', 'DELETE'])
+        def ignore_device():
+            mac = (request.get_json(silent=True) or {}).get('mac')
+            if not mac:
+                return error('MAC address required')
+            ignored = bridge.store.data.setdefault('ignored_devices', [])
+            if request.method == 'POST' and mac not in ignored:
+                ignored.append(mac)
+            elif request.method == 'DELETE' and mac in ignored:
+                ignored.remove(mac)
+            bridge.save_config()
+            return jsonify({'success': True, 'ignored_devices': ignored})
+
         @app.route('/api/control/send', methods=['POST'])
         def send_control_command():
-            """Send a control command to a light
-            
-            Expected POST data:
-            {
-                "address": 1,
-                "command_type": 1,  // 0=status, 1=control, 2=pairing, 3=group, 4=scene
-                "payload": "0164ffffff",  // hex string
-                "seq": 0
-            }
-            """
+            """Test buttons: switch a configured light through Home Assistant."""
+            data = request.get_json(silent=True) or {}
             try:
-                data = request.json
-                address = data.get('address')
-                cmd_type = data.get('command_type', 1)
-                payload_hex = data.get('payload', '')
-                seq = data.get('seq', 0)
-                
-                if address is None:
-                    return jsonify({'error': 'Address is required'}), 400
-                
-                # Get mesh key from config
-                mesh_key = self.bridge.config.get('mesh_key', '30323336')
-                if isinstance(mesh_key, str):
-                    mesh_key_bytes = bytes.fromhex(mesh_key) if len(mesh_key) == 8 else mesh_key.encode('utf-8')
-                else:
-                    mesh_key_bytes = mesh_key
-                
-                # Convert payload hex to bytes
-                payload = bytes.fromhex(payload_hex) if payload_hex else bytes()
-                
-                # Check if mesh forwarding should be enabled (default: True)
-                mesh_forward = data.get('mesh_forward', True)
-                
-                # Generate control command
-                command = create_control_command(
-                    address=address,
-                    cmd_type=cmd_type,
-                    payload=payload,
-                    mesh_key=mesh_key_bytes,
-                    seq=seq,
-                    forward=1 if mesh_forward else 0
-                )
-                
-                logger.info(f"Generated control command for address {address} (forward={1 if mesh_forward else 0}): {command.hex()}")
-                
-                # TODO: Send command via BLE
-                
-                return jsonify({
-                    'success': True,
-                    'command': command.hex(),
-                    'length': len(command)
-                })
-                
-            except Exception as e:
-                logger.error(f"Error sending control command: {e}")
-                return jsonify({'error': str(e)}), 500
-    
+                light_id = int(data.get('address'))
+            except (TypeError, ValueError):
+                return error('Address is required')
+            if light_id not in bridge.lights:
+                return error(f'Light {light_id} is not configured')
+            payload = str(data.get('payload', '')).lower()
+            on = payload not in ('00', '0', 'off')
+            brightness = 255
+            if len(payload) >= 4 and payload.startswith('01'):
+                brightness = max(1, int(payload[2:4], 16) * 255 // 100)
+            ok = bridge.set_light_color(light_id, (255, 255, 255), brightness, on)
+            return (jsonify({'success': True}) if ok else
+                    error('No Home Assistant entity for this light yet', 409))
+
+        # --- effects & scenes ----------------------------------------------
+
+        @app.route('/api/effects')
+        def list_effects():
+            return jsonify([{'name': n, 'params': e['params']} for n, e in EFFECTS.items()])
+
+        @app.route('/api/effects/<effect_name>', methods=['POST'])
+        def start_effect(effect_name):
+            data = request.get_json(silent=True) or {}
+            try:
+                effect_id = bridge.effects.start_effect(data.get('light_ids', []), effect_name, **(data.get('params') or {}))
+            except ValueError as e:
+                return error(str(e))
+            return jsonify({'success': True, 'effect_id': effect_id})
+
+        @app.route('/api/effects/stop', methods=['POST'])
+        def stop_effects():
+            effect_id = (request.get_json(silent=True) or {}).get('effect_id')
+            if effect_id:
+                bridge.effects.stop_effect(effect_id)
+            else:
+                bridge.effects.stop_all()
+            return jsonify({'success': True})
+
+        @app.route('/api/scenes')
+        def list_scenes():
+            return jsonify(bridge.store.data.get('scenes', []))
+
+        @app.route('/api/scenes', methods=['POST'])
+        def create_scene():
+            scene = request.get_json(silent=True) or {}
+            if not scene.get('name'):
+                return error('Scene name required')
+            scenes = [s for s in bridge.store.data.get('scenes', []) if s.get('name') != scene['name']]
+            scenes.append(scene)
+            bridge.store.data['scenes'] = scenes
+            bridge.save_config()
+            return jsonify({'success': True})
+
+        @app.route('/api/scenes/<scene_name>', methods=['POST'])
+        def apply_scene(scene_name):
+            scene = next((s for s in bridge.store.data.get('scenes', []) if s.get('name') == scene_name), None)
+            if not scene:
+                return error('Scene not found', 404)
+            bridge.effects.apply_scene(scene)
+            return jsonify({'success': True})
+
+        @app.route('/api/scenes/<scene_name>', methods=['DELETE'])
+        def delete_scene(scene_name):
+            bridge.store.data['scenes'] = [s for s in bridge.store.data.get('scenes', []) if s.get('name') != scene_name]
+            bridge.save_config()
+            return jsonify({'success': True})
+
+        # --- settings --------------------------------------------------------
+
+        @app.route('/api/settings')
+        def get_settings():
+            s = bridge.settings
+            return jsonify({
+                'mesh_key': bridge.mesh_key,
+                'map_enabled': s.get('map_enabled', True),
+                'latitude': s.get('latitude', 0),
+                'longitude': s.get('longitude', 0),
+                'zoom': s.get('zoom', 19),
+                'generate_esphome': s.get('generate_esphome_configs', True),
+                'enable_nspanel': s.get('enable_nspanel_ui', False),
+                'nspanel_entity_id': s.get('nspanel_entity_id', ''),
+                'adv_duration': s.get('adv_duration', 40),
+                'adv_repeats': s.get('adv_repeats', 3),
+                'include_all_lights_entity': s.get('include_all_lights_entity', True),
+                'enable_web_server': s.get('enable_web_server', False),
+            })
+
+        @app.route('/api/settings', methods=['POST'])
+        def update_settings():
+            data = request.get_json(silent=True) or {}
+            mesh_key = str(data.get('mesh_key', bridge.mesh_key) or '').strip().lower()
+            if mesh_key and not re.fullmatch(r'[0-9a-f]{8}', mesh_key):
+                return error('The mesh key must be 8 hexadecimal characters')
+            s = bridge.settings
+            for src, dest in (('map_enabled', 'map_enabled'), ('latitude', 'latitude'), ('longitude', 'longitude'),
+                              ('zoom', 'zoom'), ('generate_esphome', 'generate_esphome_configs'),
+                              ('enable_nspanel', 'enable_nspanel_ui'), ('nspanel_entity_id', 'nspanel_entity_id'),
+                              ('include_all_lights_entity', 'include_all_lights_entity'),
+                              ('enable_web_server', 'enable_web_server')):
+                if src in data and data[src] is not None:
+                    s[dest] = data[src]
+            for key, low, high in (('adv_duration', 20, 500), ('adv_repeats', 1, 10)):
+                if data.get(key) not in (None, ''):
+                    s[key] = max(low, min(high, int(data[key])))
+            key_changed = mesh_key != bridge.mesh_key
+            bridge.mesh_key = mesh_key
+            bridge.save_config()
+            if key_changed or any(k in data for k in ('adv_duration', 'adv_repeats', 'include_all_lights_entity', 'enable_web_server')):
+                bridge.esphome_generator.ensure_secrets()
+                bridge.esphome_generator.generate_all_configs(force=True)
+            return jsonify({'success': True, 'message': 'Settings saved. Reinstall the controllers to apply ESP32 changes.'})
+
+        @app.route('/api/settings/reset', methods=['POST'])
+        def reset_settings():
+            from state_store import DEFAULT_STATE
+            bridge.store.data['settings'] = dict(DEFAULT_STATE['settings'])
+            bridge.save_config()
+            return jsonify({'success': True, 'message': 'Settings reset to defaults.'})
+
+        @app.route('/api/settings/export')
+        def export_settings():
+            data = {
+                'mesh_key': bridge.mesh_key,
+                'lights': list(bridge.lights.values()),
+                'controllers': bridge.controllers,
+                'scenes': bridge.store.data.get('scenes', []),
+                'settings': bridge.settings,
+            }
+            return Response(json.dumps(data, indent=2), mimetype='application/json',
+                            headers={'Content-Disposition': 'attachment; filename=esp_ble_bridge_config.json'})
+
+        @app.route('/api/system/reset', methods=['POST'])
+        def system_reset():
+            if not (request.get_json(silent=True) or {}).get('confirm'):
+                return error('System reset requires confirmation. Set "confirm": true in request body.')
+            bridge.effects.stop_all()
+            for controller in list(bridge.controllers):
+                path = bridge.esphome_generator.config_path(controller)
+                if os.path.exists(path):
+                    os.remove(path)
+            bridge.lights.clear()
+            bridge.store.data.update(controllers=[], scenes=[], groups=[])
+            bridge.save_config()
+            return jsonify({'success': True, 'message': 'All lights, controllers and scenes have been removed.'})
+
+        # --- WiFi networks (stored in /config/esphome/secrets.yaml) ------------
+
+        @app.route('/api/wifi-networks')
+        def get_wifi_networks():
+            return jsonify({'networks': self._wifi_networks(bridge.store.read_secrets())})
+
+        @app.route('/api/wifi-networks', methods=['POST'])
+        def add_wifi_network():
+            data = request.get_json(silent=True) or {}
+            ssid, password = data.get('ssid'), data.get('password')
+            if not ssid or not password:
+                return error('SSID and password required')
+            secrets = bridge.store.read_secrets()
+            i = 0
+            while f'wifi_network_{i}_ssid' in secrets:
+                i += 1
+            values = {f'wifi_network_{i}_ssid': ssid, f'wifi_network_{i}_password': password}
+            if not secrets.get('wifi_ssid'):
+                values.update(wifi_ssid=ssid, wifi_password=password)
+            bridge.store.update_secrets(values)
+            return jsonify({'success': True, 'id': i, 'ssid': ssid})
+
+        @app.route('/api/wifi-networks/<int:network_id>', methods=['DELETE'])
+        def delete_wifi_network(network_id):
+            secrets = bridge.store.read_secrets()
+            networks = []
+            i = 0
+            while f'wifi_network_{i}_ssid' in secrets:
+                if i != network_id:
+                    networks.append((secrets[f'wifi_network_{i}_ssid'], secrets.get(f'wifi_network_{i}_password', '')))
+                i += 1
+            if network_id >= i or network_id < 0:
+                return error('Network not found', 404)
+            remove = tuple(f'wifi_network_{k}_{f}' for k in range(i) for f in ('ssid', 'password'))
+            values = {}
+            for k, (ssid, password) in enumerate(networks):
+                values[f'wifi_network_{k}_ssid'] = str(ssid)
+                values[f'wifi_network_{k}_password'] = str(password)
+            bridge.store.update_secrets(values, remove=remove)
+            return jsonify({'success': True})
+
+        @app.route('/api/wifi-networks/<int:network_id>/set-default', methods=['POST'])
+        def set_default_wifi_network(network_id):
+            secrets = bridge.store.read_secrets()
+            ssid = secrets.get(f'wifi_network_{network_id}_ssid')
+            if not ssid:
+                return error('Network not found', 404)
+            bridge.store.update_secrets({'default_wifi_network': network_id, 'wifi_ssid': str(ssid),
+                                         'wifi_password': str(secrets.get(f'wifi_network_{network_id}_password', ''))})
+            return jsonify({'success': True})
+
+        # --- misc ----------------------------------------------------------------
+
+        @app.route('/api/map/satellite')
+        def get_satellite_map():
+            s = bridge.settings
+            return jsonify({'center': {'lat': s.get('latitude', 0), 'lon': s.get('longitude', 0)}, 'zoom': s.get('zoom', 19)})
+
+        @app.route('/api/nspanel/refresh', methods=['POST'])
+        def refresh_nspanel():
+            if not bridge.nspanel_ui:
+                return error('NSPanel UI not enabled')
+            bridge.nspanel_ui.refresh_nspanel_display()
+            return jsonify({'success': True})
+
+        @app.errorhandler(413)
+        def too_large(_):
+            return error('File too large for a BRMesh export', 413)
+
     def run(self, host='0.0.0.0', port=8099):
-        """Run the web UI with production WSGI server"""
         from waitress import serve
-        logger.info(f"🚀 Starting Waitress WSGI server on {host}:{port}")
-        serve(app, host=host, port=port, threads=4, channel_timeout=300)
+        logger.info(f"Web UI listening on {host}:{port}")
+        serve(app, host=host, port=port, threads=8, channel_timeout=120)

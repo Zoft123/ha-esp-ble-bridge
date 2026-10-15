@@ -6,19 +6,24 @@
 ![Supports armv7 Architecture][armv7-shield]
 ![Supports i386 Architecture][i386-shield]
 
-Bridge Fastcon/BRMesh protocol BLE lights to Home Assistant with GUI configuration, BLE discovery, effects engine, and phone-free operation.
+Bridge Fastcon/BRMesh protocol BLE lights to Home Assistant through ESP32 controllers, set up from your BRMesh app export.
 
 ## About
 
-This repository contains the ESP BLE Bridge add-on for Home Assistant, which enables control of Fastcon/BRMesh protocol BLE lights through MQTT, with advanced features including:
+This repository contains the ESP BLE Bridge add-on for Home Assistant. An ESP32 running ESPHome sends the
+BRMesh/FastCon BLE commands; the add-on sets it up and gives you a dashboard:
 
-- **GUI Configuration** - All settings through web interface, no YAML editing required
-- **BLE Discovery** - Find lights without the phone app
-- **Effects Engine** - Built-in animations (rainbow, fire, twinkle, etc.)
-- **Map View** - Visualize light and controller locations
-- **ESPHome Generation** - Auto-generate ESP32 controller configs
-- **Multi-Controller** - Support multiple ESP32 controllers
-- **NSPanel Integration** - Optional Nextion display support
+- **Import from the BRMesh app** - upload the app's export file from your phone or computer; the mesh key,
+  light IDs, names and types are read from it
+- **ESPHome generation and install** - builds the controller firmware with bundled FastCon components and
+  installs it over USB or Wi-Fi
+- **Fast, reliable control** - newest-state-wins command scheduling with repeats, an "All Lights" broadcast
+  entity, no BLE scanning competing with the commands
+- **Effects and scenes** - paced to what BLE can deliver
+- **Map View** - place lights and controllers on a map
+- **Multi-Controller** - every controller can reach every light through the mesh
+
+Lights are paired with the BRMesh app; pairing from the ESP32 is not supported.
 
 ## Add-ons
 

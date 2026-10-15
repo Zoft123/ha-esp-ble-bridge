@@ -1270,3 +1270,25 @@ body.dark-mode .status-message.error {
     border-color: #7d2e2e;
     color: #fc8181;
 }
+
+/* --- Import from BRMesh app --- */
+.import-modal-content { max-width: 720px; width: calc(100% - 32px); }
+.import-drop {
+    position: relative;
+    border: 2px dashed #8a8fa3;
+    border-radius: 8px;
+    padding: 28px 16px;
+    text-align: center;
+    margin: 12px 0;
+    cursor: pointer;
+}
+.import-drop.drag { border-color: #2196F3; background: rgba(33, 150, 243, 0.08); }
+.import-drop input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+#import-text { width: 100%; box-sizing: border-box; margin: 8px 0; font-family: monospace; }
+.import-table-wrap { max-height: 320px; overflow: auto; margin: 10px 0; }
+.import-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+.import-table th, .import-table td { padding: 4px 8px; border-bottom: 1px solid rgba(128, 128, 128, 0.3); text-align: left; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+.light-meta { font-size: 0.8em; opacity: 0.75; margin: 2px 0 8px; }
+.warn { color: #e67e22; }
+.status-message.error { color: #e74c3c; }
