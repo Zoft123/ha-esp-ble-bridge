@@ -103,7 +103,7 @@ class StateStore:
             if old.get(key):
                 migrated[key] = old[key]
         lights = old.get('lights')
-        if isinstance(lights, dict):  # EXAMPLE_CONFIG.json style {"1": {...}}
+        if isinstance(lights, dict):  # very old versions: {"1": {...}}
             lights = [dict(v, light_id=int(k)) for k, v in lights.items()]
         if lights:
             migrated['lights'] = lights

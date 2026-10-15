@@ -3,7 +3,7 @@ version: 0.60.0
 
 slug: esp-ble-bridge
 description: Control BRMesh/FastCon BLE lights from Home Assistant through ESP32 controllers, set up from your BRMesh app export
-url: https://github.com/tofuweasel/ha-esp-ble-bridge
+url: https://github.com/Zoft123/ha-esp-ble-bridge
 # ESPHome/PlatformIO only provide ESP32 toolchains for 64-bit hosts.
 arch:
   - aarch64

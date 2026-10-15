@@ -53,13 +53,13 @@ LABEL \
     io.hass.arch="${BUILD_ARCH}" \
     io.hass.type="addon" \
     io.hass.version="${BUILD_VERSION}" \
-    maintainer="tofuweasel" \
+    maintainer="Zoft123" \
     org.opencontainers.image.title="${BUILD_NAME}" \
     org.opencontainers.image.description="${BUILD_DESCRIPTION}" \
-    org.opencontainers.image.vendor="Home Assistant Community Add-ons" \
-    org.opencontainers.image.authors="tofuweasel" \
+    org.opencontainers.image.vendor="Zoft123" \
+    org.opencontainers.image.authors="Zoft123" \
     org.opencontainers.image.licenses="MIT" \
-    org.opencontainers.image.url="https://github.com/tofuweasel/ha-brmesh-bridge" \
+    org.opencontainers.image.url="https://github.com/Zoft123/ha-esp-ble-bridge" \
     org.opencontainers.image.source="https://github.com/${BUILD_REPOSITORY}" \
     org.opencontainers.image.documentation="https://github.com/${BUILD_REPOSITORY}/blob/main/README.md" \
     org.opencontainers.image.created="${BUILD_DATE}" \

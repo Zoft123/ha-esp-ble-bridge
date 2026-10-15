@@ -1,97 +1,134 @@
-# ESP BLE Bridge Home Assistant Add-on Repository
+# ESP BLE Bridge for Home Assistant
 
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
-![Supports armhf Architecture][armhf-shield]
-![Supports armv7 Architecture][armv7-shield]
-![Supports i386 Architecture][i386-shield]
 
-Bridge Fastcon/BRMesh protocol BLE lights to Home Assistant through ESP32 controllers, set up from your BRMesh app export.
+Control BRMesh / FastCon Bluetooth lights from Home Assistant through an ESP32 running ESPHome. You set it up
+from the export of the BRMesh phone app: no phone has to stay nearby, and no MQTT broker is needed.
 
-## About
+## How it works
 
-This repository contains the ESP BLE Bridge add-on for Home Assistant. An ESP32 running ESPHome sends the
-BRMesh/FastCon BLE commands; the add-on sets it up and gives you a dashboard:
+```
+Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE advertisements──▶ BRMesh lights (mesh)
+       ▲
+       └── ESP BLE Bridge add-on: imports the app export, generates/builds/installs the ESP32 firmware,
+           dashboard, scenes and effects
+```
 
-- **Import from the BRMesh app** - upload the app's export file from your phone or computer; the mesh key,
-  light IDs, names and types are read from it
-- **ESPHome generation and install** - builds the controller firmware with bundled FastCon components and
-  installs it over USB or Wi-Fi
-- **Fast, reliable control** - newest-state-wins command scheduling with repeats, an "All Lights" broadcast
-  entity, no BLE scanning competing with the commands
-- **Effects and scenes** - paced to what BLE can deliver
-- **Map View** - place lights and controllers on a map
-- **Multi-Controller** - every controller can reach every light through the mesh
+- The **ESP32** sends the lights' Bluetooth commands. Each light becomes a normal light entity in Home Assistant
+  (through the ESPHome integration), plus an **All Lights** entity that switches every lamp with one packet.
+- The **add-on** reads the mesh key and the lights (IDs, names, types) from the BRMesh app's export, writes the
+  ESPHome configuration, builds the firmware and installs it on the ESP32.
 
-Lights are paired with the BRMesh app; pairing from the ESP32 is not supported.
+## Features
 
-## Add-ons
+- **Import from the BRMesh app**: upload the app's export file from your phone or computer in the add-on's web
+  UI. The add-on reads the mesh key and every light's ID, name and type. The app's share code and its
+  `setting.xml` (mesh key only) are accepted too. Devices that are not lights (sockets, curtains, panels,
+  sensors, gateways) are listed and skipped.
+- **All BRMesh light types**: RGB + cold/warm white, RGBW, RGB, cold/warm white and dimmable lamps each get the
+  matching controls in Home Assistant.
+- **Responsive, reliable control**: the newest state for each light replaces older pending commands, every
+  light gets its first packet before any repeats, and each command is repeated (configurable) so lamps that
+  miss one advertisement still get it. The radio is not shared with a BLE scanner.
+- **No surprises on reboot**: restarting the ESP32 does not switch any lamps.
+- **Build and install from the add-on**: firmware is compiled in the add-on with the bundled FastCon
+  components and installed over USB (first time) or Wi-Fi, with live build output.
+- **Several controllers**: every ESP32 can reach every light through the mesh; you can also give each
+  controller its own subset of lights (for coverage, or for large meshes; one ESP32 comfortably handles about
+  100 lights).
+- **Scenes and effects**, paced to what Bluetooth can deliver, and a **map view** to place lights and
+  controllers.
 
-This repository contains the following add-on:
+## Requirements
 
-### [ESP BLE Bridge](./esp-ble-bridge)
-
-Control Fastcon/BRMesh protocol BLE lights through Home Assistant with advanced features and GUI configuration.
-
-![Supports aarch64 Architecture][aarch64-shield]
-![Supports amd64 Architecture][amd64-shield]
-![Supports armhf Architecture][armhf-shield]
-![Supports armv7 Architecture][armv7-shield]
-![Supports i386 Architecture][i386-shield]
+- Home Assistant OS or Supervised on a **64-bit** machine (amd64 or aarch64, e.g. Raspberry Pi 4/5).
+- An **ESP32** with Bluetooth: ESP32 (WROOM/WROVER dev boards), ESP32-S3, ESP32-C3 or ESP32-C6.
+  The ESP32-S2 (no Bluetooth) and ESP32-H2 (no Wi-Fi) cannot be used.
+- Your lights paired in the **BRMesh** app, and its export file.
+- The **ESPHome** integration in Home Assistant (it is offered automatically once the ESP32 is online).
 
 ## Installation
 
-1. Click the button below to add this repository to Home Assistant:
+1. Add this repository to Home Assistant:
 
-   [![Add Repository](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/tofuweasel/ha-esp-ble-bridge)
+   [![Add Repository](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FZoft123%2Fha-esp-ble-bridge)
 
-   Or manually:
-   - Go to **Settings** → **Add-ons** → **Add-on Store**
-   - Click **⋮** (menu) → **Repositories**
-   - Add: `https://github.com/tofuweasel/ha-esp-ble-bridge`
-   - Click **Add** → **Close**
+   Or manually: **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add
+   `https://github.com/Zoft123/ha-esp-ble-bridge`.
+2. Install **ESP BLE Bridge** and start it. The first install builds the add-on image on your machine and takes
+   a few minutes.
+3. Open the add-on's web UI.
 
-2. Find "ESP BLE Bridge" in the add-on store and click **Install**
+## Setup
 
-3. Start the add-on and open the Web UI to configure
+1. **Export from the BRMesh app.** Pair your lights in the app as usual, then use the app's export. It creates a
+   file named `BRMESH_BACKUP…` (you can rename it).
+2. **Import it.** In the add-on, click **📱 Import from BRMesh App** and choose the file. Check the preview (number
+   of lights, types, skipped devices) and click **Import**.
+3. **Add a controller.** In **Controllers**, create a controller: pick your board and Wi-Fi network.
+4. **Install the firmware.** Connect the ESP32 to the Home Assistant machine with USB and click **⚡ Install**,
+   then choose the USB port. The first build downloads the ESP32 toolchain and takes 5-15 minutes; later
+   builds are much faster, and later installs can go over Wi-Fi.
+5. **Add it to Home Assistant.** Under **Settings → Devices & Services**, add the discovered ESPHome device
+   (the API key is in `/config/esphome/secrets.yaml`). Your lights appear as light entities.
 
-## Documentation
+When you add, rename or remove lights later, import a new export (or edit the lights in the add-on), then click
+**⚡ Install** on each controller again.
 
-- [Quick Start Guide](./brmesh-bridge/QUICK_START.md) - Get started in 5 minutes
-- [GUI Configuration Guide](./brmesh-bridge/GUI_CONFIGURATION.md) - Complete configuration reference
-- [Setup Guide](./brmesh-bridge/SETUP_GUIDE.md) - Detailed setup instructions
-- [Changelog](./brmesh-bridge/CHANGELOG.md) - Version history
+## Settings
+
+- **Advertising time per packet / repeats per command**: raise these if lights far from the ESP32 miss
+  commands; lower them for faster response with many lights changing at once.
+- **"All Lights" entity**: one Bluetooth packet for all lamps.
+- **ESP32 web server**: off by default; it costs memory and CPU on the ESP32.
+- To manage a controller's ESPHome YAML yourself, add a line reading exactly `# manual_config: true`; the
+  add-on then leaves that file alone.
+
+## Limitations
+
+- **New lights are paired with the BRMesh app**, not from the ESP32. Unpaired lights only answer the app's
+  scan request, and the app builds its pairing reply in a native library that has not been reverse
+  engineered. After pairing in the app, import a new export.
+- **One mesh per add-on.** The add-on uses one mesh key (the app's normal and "radar" meshes have separate keys;
+  you choose which to import).
+- **Light IDs 1-255.** Lights above 255 use the app's extended addressing, which is not supported yet; they are
+  listed as skipped on import.
+- **No state feedback.** BRMesh lights do not report their state, so Home Assistant shows the last state it
+  sent.
+- Colors through the **All Lights** entity are verified on RGB + cold/warm white lamps. With mixed lamp types,
+  the add-on sends colors light by light and uses All Lights for on/off and brightness.
+
+## Troubleshooting
+
+- **Build fails with "Secret ... not defined"**: open **Settings** in the add-on and save, or re-import; the
+  add-on writes the needed secrets to `/config/esphome/secrets.yaml`.
+- **First install over Wi-Fi fails**: a controller that ran older (Arduino-based) firmware needs one install
+  over USB.
+- **A light shows "not in Home Assistant yet"**: install the firmware on a controller that has the light and add
+  the ESPHome device in Home Assistant.
+- **Build output**: **Controllers → 📋 Output**, or the add-on log.
+
+## Development
+
+- `rootfs/app/`: the add-on (Flask web UI, importer, ESPHome generator and builder).
+- `esphome_components/`: the ESPHome components installed to `/config/esphome/esp_ble_bridge_components`.
+- Tests: `python3 -m unittest discover tests` (importer and generator) and `tests/fastcon_scheduler/run.sh`
+  (the ESP32 command scheduler, built with the host compiler).
+
+See the [changelog](CHANGELOG.md) for what changed in each version.
 
 ## Credits
 
-This add-on uses the [esphome-fastcon](https://github.com/scross01/esphome-fastcon) component by [@scross01](https://github.com/scross01) for ESPHome integration with BRMesh/Fastcon protocol lights.
+- The ESPHome components are based on [esphome-fastcon](https://github.com/scross01/esphome-fastcon) by
+  [@scross01](https://github.com/scross01), MIT licensed (see `esphome_components/LICENSE.fastcon`).
+- This repository started as a fork of
+  [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge).
 
-## Support
+## Issues
 
-If you find this add-on useful, please consider starring the repository! ⭐
-
-### Support Development
-
-This project is developed and maintained in my spare time. If you'd like to support continued development and new features:
-
-<a href="https://www.buymeacoffee.com/tofuweasel" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
-
-[![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/tofuweasel)
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/tofuweasel)
-
-Every contribution helps keep the lights on (literally! 💡) and enables me to:
-- Add new features
-- Fix bugs faster
-- Test with more hardware
-- Write better documentation
-- Create video tutorials
-
-### Issues & Feature Requests
-
-For issues and feature requests, please use the [GitHub issue tracker](https://github.com/tofuweasel/ha-brmesh-bridge/issues).
+Report problems and ideas in the [issue tracker](https://github.com/Zoft123/ha-esp-ble-bridge/issues).
+Maintained by [@Zoft123](https://github.com/Zoft123).
 
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
-[armhf-shield]: https://img.shields.io/badge/armhf-yes-green.svg
-[armv7-shield]: https://img.shields.io/badge/armv7-yes-green.svg
-[i386-shield]: https://img.shields.io/badge/i386-yes-green.svg

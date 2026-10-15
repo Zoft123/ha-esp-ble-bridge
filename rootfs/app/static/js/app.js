@@ -201,7 +201,7 @@ async function checkFirmwareUpdate() {
         if (data.update_available) {
             updateMessage.innerHTML = `<strong style="color: #FFD700;">🎉 New version available!</strong> <a href="${data.release_url}" target="_blank" style="color: white; text-decoration: underline;">View Release Notes</a>`;
             updateMessage.style.display = 'block';
-            downloadLink.href = 'https://github.com/tofuweasel/esp-ble-bridge-firmware/releases/latest';
+            downloadLink.href = 'https://github.com/Zoft123/ha-esp-ble-bridge/releases';
             downloadLink.style.display = 'block';
             showNotification('🎉 Firmware update available! Download from the Controllers tab.', 'success');
         } else {
