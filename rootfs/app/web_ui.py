@@ -7,7 +7,7 @@ import logging
 import os
 import re
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from brmesh_export import ExportError, mask_key, parse_export, select_mesh
@@ -341,7 +341,8 @@ class WebUI:
         def get_build_status(controller_name):
             path = bridge.esphome_builder.find_firmware_binary(controller_name)
             job = bridge.esphome_builder.job(controller_name)
-            return jsonify({'built': bool(path), 'path': path, 'job': job.to_dict() if job else None})
+            return jsonify({'built': bool(path), 'up_to_date': bridge.esphome_builder.firmware_up_to_date(controller_name),
+                            'path': path, 'job': job.to_dict() if job else None})
 
         @app.route('/api/esphome/job/<controller_name>')
         def get_job(controller_name):
@@ -365,7 +366,9 @@ class WebUI:
         def flash_firmware(controller_name):
             data = request.get_json(silent=True) or {}
             port = data.get('port') or 'OTA'
-            action = 'upload' if bridge.esphome_builder.find_firmware_binary(controller_name) and not data.get('rebuild') else 'compile_upload'
+            # Never install a binary that is older than the current YAML (lights changed since the build).
+            up_to_date = bridge.esphome_builder.firmware_up_to_date(controller_name)
+            action = 'upload' if up_to_date and not data.get('rebuild') else 'compile_upload'
             return _start_job(controller_name, action, port)
 
         @app.route('/api/esphome/install/<controller_name>', methods=['POST'])
@@ -376,6 +379,34 @@ class WebUI:
         @app.route('/api/esphome/ports')
         def get_serial_ports():
             return jsonify({'ports': bridge.esphome_builder.list_serial_ports()})
+
+        @app.route('/api/esphome/firmware/<controller_name>')
+        def download_firmware(controller_name):
+            """The factory image (offset 0) for flashing from another computer, e.g. web.esphome.io."""
+            path = bridge.esphome_builder.find_firmware_binary(controller_name)
+            if not path:
+                return error('No firmware built yet for this controller. Click Build first.', 404)
+            return send_file(path, mimetype='application/octet-stream', as_attachment=True,
+                             download_name=f"{controller_slug(controller_name)}.factory.bin")
+
+        @app.route('/api/esphome/manifest/<controller_name>')
+        def firmware_manifest(controller_name):
+            """ESP Web Tools manifest, so the browser can flash an ESP32 plugged into this computer."""
+            controller = self._controller(controller_name)
+            if not controller:
+                return error('Controller not found', 404)
+            board = (controller.get('board') or bridge.settings.get('board') or 'esp32dev').lower()
+            family = 'ESP32'
+            for marker, name in (('s3', 'ESP32-S3'), ('c3', 'ESP32-C3'), ('c6', 'ESP32-C6'), ('s2', 'ESP32-S2')):
+                if f'esp32-{marker}' in board or f'esp32{marker}' in board:
+                    family = name
+            return jsonify({
+                'name': f"ESP BLE Bridge ({controller['name']})",
+                'version': BRIDGE_FIRMWARE_VERSION,
+                'new_install_prompt_erase': True,
+                'builds': [{'chipFamily': family,
+                            'parts': [{'path': f"../firmware/{controller_slug(controller['name'])}", 'offset': 0}]}],
+            })
 
         @app.route('/api/esphome/logs/<controller_name>')
         def get_esphome_logs(controller_name):

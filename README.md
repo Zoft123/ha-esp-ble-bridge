@@ -33,7 +33,8 @@ Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE ad
   miss one advertisement still get it. The radio is not shared with a BLE scanner.
 - **No surprises on reboot**: restarting the ESP32 does not switch any lamps.
 - **Build and install from the add-on**: firmware is compiled in the add-on with the bundled FastCon
-  components and installed over USB (first time) or Wi-Fi, with live build output.
+  components and installed on the ESP32 you choose: over USB on the Home Assistant machine, from the computer
+  you are browsing on, or over Wi-Fi, with live build output.
 - **Several controllers**: every ESP32 can reach every light through the mesh; you can also give each
   controller its own subset of lights (for coverage, or for large meshes; one ESP32 comfortably handles about
   100 lights).
@@ -67,9 +68,16 @@ Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE ad
 2. **Import it.** In the add-on, click **📱 Import from BRMesh App** and choose the file. Check the preview (number
    of lights, types, skipped devices) and click **Import**.
 3. **Add a controller.** In **Controllers**, create a controller: pick your board and Wi-Fi network.
-4. **Install the firmware.** Connect the ESP32 to the Home Assistant machine with USB and click **⚡ Install**,
-   then choose the USB port. The first build downloads the ESP32 toolchain and takes 5-15 minutes; later
-   builds are much faster, and later installs can go over Wi-Fi.
+4. **Install the firmware.** Click **⚡ Install** on the controller card and choose the ESP32 to install on:
+   - **USB on the Home Assistant machine**: plug the ESP32 into the HA machine; it is listed by its USB adapter
+     name (click Refresh after plugging it in).
+   - **This computer**: plug the ESP32 into the computer you are browsing from. In Chrome or Edge with Home
+     Assistant opened over HTTPS, the page flashes it directly; otherwise download the firmware and flash it
+     with [web.esphome.io](https://web.esphome.io).
+   - **Wi-Fi (OTA)**: for an ESP32 that already runs this firmware (later updates).
+
+   The first build downloads the ESP32 toolchain and takes 5-15 minutes; later builds are much faster. The add-on
+   rebuilds automatically when the lights or settings changed since the last build.
 5. **Add it to Home Assistant.** Under **Settings → Devices & Services**, add the discovered ESPHome device
    (the API key is in `/config/esphome/secrets.yaml`). Your lights appear as light entities.
 

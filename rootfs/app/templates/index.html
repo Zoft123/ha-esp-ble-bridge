@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP BLE Bridge - Light Management</title>
-    <link rel="stylesheet" href="static/css/style.css?v=0.60.0">
+    <link rel="stylesheet" href="static/css/style.css?v=0.60.1">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
@@ -26,7 +26,7 @@
         <header>
             <div class="header-title">
                 <h1>🔆 ESP BLE Bridge</h1>
-                <span class="version">v0.60.0 (Firmware: <span id="firmware-version-display">{{ version }}</span>)</span>
+                <span class="version">v0.60.1 (Firmware: <span id="firmware-version-display">{{ version }}</span>)</span>
             </div>
             <div class="header-controls">
                 <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle Dark Mode">🌙</button>
@@ -51,12 +51,6 @@
             <div class="map-container">
                 <div id="map"></div>
                 <div class="map-controls">
-                    <div class="control-group">
-                        <label>
-                            <input type="checkbox" id="show-signal-strength" />
-                            Show Signal Strength
-                        </label>
-                    </div>
                     <div class="control-group">
                         <label>
                             <input type="checkbox" id="show-controllers" checked />
@@ -188,31 +182,8 @@
                 <h2>ESP32 Controllers</h2>
                 
                 <!-- Firmware Info Card -->
-                <div id="firmware-info-card" class="controller-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <strong style="font-size: 1.1em;">📦 Firmware Management</strong>
-                            <div style="margin-top: 10px; font-size: 0.95em;">
-                                <div>Current Version: <strong id="current-fw-version">1.1</strong></div>
-                                <div id="latest-fw-version-display" style="margin-top: 5px;">Latest Version: <span id="latest-fw-version">checking...</span></div>
-                                <div id="fw-update-message" style="margin-top: 5px; display: none;"></div>
-                            </div>
-                        </div>
-                        <div style="display: flex; flex-direction: column; gap: 10px;">
-                            <button class="btn btn-primary" onclick="checkFirmwareUpdate()" style="white-space: nowrap;">🔍 Check for Updates</button>
-                            <a id="fw-download-link" href="https://github.com/Zoft123/ha-esp-ble-bridge" target="_blank" class="btn btn-success" style="text-decoration: none; text-align: center; display: none;">📥 Download Latest</a>
-                        </div>
-                    </div>
-                </div>
-                
                 <div class="controllers-grid" id="controllers-grid">
                     <!-- Populated by JavaScript -->
-                </div>
-                <div class="signal-matrix">
-                    <h3>Signal Strength Matrix</h3>
-                    <div id="signal-matrix">
-                        <!-- Populated by JavaScript -->
-                    </div>
                 </div>
                 <div class="controller-actions">
                     <button id="create-controller-btn" class="btn btn-success">🔨 Create New ESP32</button>
@@ -392,7 +363,7 @@
         </div>
     </div>
 
-    <script src="static/js/app.js?v=0.60.0"></script>
+    <script src="static/js/app.js?v=0.60.1"></script>
     <script>
     function toggleMapSettings() {
         const mapEnabled = document.getElementById('map-enabled').checked;

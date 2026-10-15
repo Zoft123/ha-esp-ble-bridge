@@ -5,6 +5,24 @@ All notable changes to the ESP BLE Bridge add-on will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.1] - 2026-10-15
+
+### Added
+- **Choose the ESP32 to install on**: ⚡ Install opens a dialog with the USB serial devices on the Home
+  Assistant machine (by adapter name, with Refresh), **this computer** (flashes the ESP32 plugged into the
+  computer you are browsing from with ESP Web Tools; without HTTPS it offers the firmware download for
+  web.esphome.io) and Wi-Fi (OTA). Previously Install silently fell back to OTA when no USB device was found.
+- Firmware download (factory image) and ESP Web Tools manifest endpoints.
+
+### Fixed
+- Install never flashes a firmware that is older than the controller's YAML, secrets or components; it
+  rebuilds first.
+
+### Removed
+- The "Firmware Management / Check for Updates" card, the signal strength matrix and the "Show Signal
+  Strength" map option (they showed version 1.1 of the old firmware and mock data), and the outdated text in
+  the new-controller dialog.
+
 ## [0.60.0] - 2026-10-15
 
 ### Added

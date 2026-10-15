@@ -1292,3 +1292,8 @@ body.dark-mode .status-message.error {
 .light-meta { font-size: 0.8em; opacity: 0.75; margin: 2px 0 8px; }
 .warn { color: #e67e22; }
 .status-message.error { color: #e74c3c; }
+
+/* --- Install dialog --- */
+.install-option { display: block; margin: 6px 0; cursor: pointer; }
+.install-note { font-size: 0.85em; opacity: 0.8; margin: 6px 0; }
+.import-modal-content h3 { margin: 14px 0 4px; font-size: 1em; }

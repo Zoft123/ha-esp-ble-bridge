@@ -134,14 +134,33 @@ class ESPHomeBuilder:
                 return line.strip()
         return (lines[-1] if lines else (job.output[-1] if job.output else 'Unknown error')).strip()
 
-    def list_serial_ports(self) -> list:
-        ports = sorted(set(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*') + glob.glob('/dev/serial/by-id/*')))
-        return ports
+    def list_serial_ports(self) -> List[Dict]:
+        """USB serial devices on the Home Assistant machine, with readable names where available."""
+        ports = {}
+        for dev in sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')):
+            ports[os.path.realpath(dev)] = {'path': dev, 'label': dev}
+        # /dev/serial/by-id names the adapter, e.g. usb-Silicon_Labs_CP2102_..._0001-if00-port0
+        for link in sorted(glob.glob('/dev/serial/by-id/*')):
+            real = os.path.realpath(link)
+            name = os.path.basename(link).replace('usb-', '').replace('_', ' ')
+            ports[real] = {'path': link, 'label': f"{name} ({os.path.basename(real)})"}
+        return list(ports.values())
 
-    def find_firmware_binary(self, controller_name: str) -> Optional[str]:
+    def find_firmware_binary(self, controller_name: str, factory: bool = True) -> Optional[str]:
         name = controller_slug(controller_name)
-        for path in (f"{self.build_dir}/.esphome/build/{name}/.pioenvs/{name}/firmware.factory.bin",
-                     f"{self.build_dir}/.esphome/build/{name}/.pioenvs/{name}/firmware.bin"):
+        base = f"{self.build_dir}/.esphome/build/{name}/.pioenvs/{name}"
+        candidates = ([f"{base}/firmware.factory.bin"] if factory else []) + [f"{base}/firmware.bin"]
+        for path in candidates:
             if os.path.exists(path):
                 return path
         return None
+
+    def firmware_up_to_date(self, controller_name: str) -> bool:
+        """True if a firmware exists that was built after the last change to the YAML or components."""
+        binary = self.find_firmware_binary(controller_name)
+        if not binary:
+            return False
+        built = os.path.getmtime(binary)
+        sources = [self.yaml_path(controller_name), os.path.join(self.build_dir, 'secrets.yaml')]
+        sources += glob.glob(os.path.join(self.build_dir, 'esp_ble_bridge_components', '*', '*'))
+        return all(not os.path.exists(src) or os.path.getmtime(src) <= built for src in sources)

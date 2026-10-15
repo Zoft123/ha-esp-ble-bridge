@@ -181,42 +181,6 @@ async function checkFirmwareVersion() {
     }
 }
 
-async function checkFirmwareUpdate() {
-    const currentVersion = document.getElementById('current-fw-version');
-    const latestVersion = document.getElementById('latest-fw-version');
-    const updateMessage = document.getElementById('fw-update-message');
-    const downloadLink = document.getElementById('fw-download-link');
-    
-    try {
-        latestVersion.textContent = 'checking...';
-        updateMessage.style.display = 'none';
-        downloadLink.style.display = 'none';
-        
-        const response = await fetch('api/firmware/check');
-        const data = await response.json();
-        
-        currentVersion.textContent = data.current_version || '1.1';
-        latestVersion.textContent = data.latest_version || 'Unknown';
-        
-        if (data.update_available) {
-            updateMessage.innerHTML = `<strong style="color: #FFD700;">🎉 New version available!</strong> <a href="${data.release_url}" target="_blank" style="color: white; text-decoration: underline;">View Release Notes</a>`;
-            updateMessage.style.display = 'block';
-            downloadLink.href = 'https://github.com/Zoft123/ha-esp-ble-bridge/releases';
-            downloadLink.style.display = 'block';
-            showNotification('🎉 Firmware update available! Download from the Controllers tab.', 'success');
-        } else {
-            updateMessage.innerHTML = '<strong style="color: #90EE90;">✅ You\'re running the latest firmware version!</strong>';
-            updateMessage.style.display = 'block';
-            showNotification('✅ Firmware is up to date!', 'success');
-        }
-    } catch (error) {
-        console.error('Failed to check firmware version:', error);
-        latestVersion.textContent = 'Error';
-        updateMessage.innerHTML = '<strong style="color: #FFB6C1;">❌ Could not check for updates</strong>';
-        updateMessage.style.display = 'block';
-        showNotification('❌ Failed to check for firmware updates', 'error');
-    }
-}
 
 async function loadLights() {
     try {
@@ -886,12 +850,8 @@ async function createController() {
         <div class="modal-content">
             <span class="close" onclick="this.parentElement.parentElement.remove()">&times;</span>
             <h2>🔨 Create New ESP32 Controller</h2>
-            <p>Build and flash a new ESP32 controller. Just provide your WiFi credentials and we'll handle the rest!</p>
-            
-            <div class="info-box" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-bottom: 20px;">
-                <strong>📦 Firmware Version: 1.1</strong>
-                <p style="margin: 5px 0 0 0; opacity: 0.9;">Latest stable release with native mesh-based pairing</p>
-            </div>
+            <p>Set up a new ESP32. The add-on writes its ESPHome configuration with all your imported lights;
+               afterwards you install it with ⚡ Install on the controller card.</p>
             
             <div class="form-group">
                 <label for="wifi-network-selector">WiFi Network: <span style="color: red;">*</span></label>
@@ -935,11 +895,11 @@ async function createController() {
             <div class="info-box">
                 <strong>What happens next:</strong>
                 <ol>
-                    <li>Controller config and WiFi secrets are generated automatically</li>
-                    <li>Firmware compiles (takes 5-10 minutes first time)</li>
-                    <li>Connect your ESP32 via USB</li>
-                    <li>Click "Flash" to upload firmware</li>
-                    <li>Your ESP32 connects to WiFi and appears in Home Assistant!</li>
+                    <li>The ESPHome configuration and Wi-Fi secrets are written for you</li>
+                    <li>Click ⚡ Install on the new controller card and choose your ESP32: USB on the Home Assistant
+                        machine, this computer (browser), or Wi-Fi for an ESP32 that already runs this firmware</li>
+                    <li>The first build downloads the ESP32 toolchain (5-15 minutes); later builds are quick</li>
+                    <li>Add the ESP32 in Home Assistant under Settings → Devices &amp; Services → ESPHome</li>
                 </ol>
                 <p><small>💡 Name, IP, and location can be configured later in the Controllers tab.</small></p>
             </div>
@@ -2107,66 +2067,139 @@ async function buildFirmware(controllerName, button = null) {
     await startFirmwareJob(controllerName, 'build', {}, 'Build');
 }
 
-async function choosePort() {
-    const portsResponse = await fetch('api/esphome/ports');
-    const portsData = await portsResponse.json();
-    if (portsData.ports && portsData.ports.length > 0) {
-        // Offer USB ports, with Wi-Fi (OTA) as the default.
-        return await showPortSelectionDialog(['OTA', ...portsData.ports]);
+const ESP_WEB_TOOLS = 'https://unpkg.com/esp-web-tools@10.2.1/dist/web/install-button.js?module';
+
+function canFlashFromBrowser() {
+    // Web Serial only exists in Chrome/Edge, and only on HTTPS (or localhost) pages.
+    return window.isSecureContext && 'serial' in navigator;
+}
+
+async function waitForJob(controllerName) {
+    while (true) {
+        await new Promise(r => setTimeout(r, 3000));
+        const response = await fetch(`api/esphome/job/${controllerName}`);
+        if (!response.ok) return null;
+        const job = await response.json();
+        if (!job.running) return job;
     }
-    return 'OTA';
+}
+
+function closeModal(el) {
+    const modal = el.closest('.modal');
+    if (modal) modal.remove();
 }
 
 async function installFirmware(controllerName, button = null) {
-    const port = await choosePort();
-    if (!port) return;
-    await startFirmwareJob(controllerName, 'install', { port }, 'Install');
+    const controller = controllers.find(c => c.name.toLowerCase().replace(/ /g, '-') === controllerName) || {};
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.display = 'block';
+    document.body.appendChild(modal);
+
+    const render = async () => {
+        let ports = [];
+        try {
+            ports = (await (await fetch('api/esphome/ports')).json()).ports || [];
+        } catch (e) { /* no ports */ }
+        const usb = ports.length
+            ? ports.map((p, i) => `<label class="install-option"><input type="radio" name="install-target" value="usb" data-port="${escapeHtml(p.path)}" ${i === 0 ? 'checked' : ''}> ${escapeHtml(p.label)}</label>`).join('')
+            : '<div class="install-note">No ESP32 found. Plug it into a USB port of the Home Assistant machine and click Refresh.</div>';
+        const browser = canFlashFromBrowser()
+            ? 'Flash the ESP32 connected to the computer you are using right now (Chrome or Edge).'
+            : 'Download the firmware and flash it from this computer with web.esphome.io (this page is not HTTPS, so the browser cannot flash directly).';
+        modal.innerHTML = `
+            <div class="modal-content import-modal-content">
+                <h2>⚡ Install on which ESP32?</h2>
+                <p><strong>${escapeHtml(controller.name || controllerName)}</strong> · board ${escapeHtml(controller.board || 'esp32dev')} · ${controller.light_count ?? ''} lights</p>
+                <h3>USB on the Home Assistant machine</h3>
+                ${usb}
+                <h3>This computer</h3>
+                <label class="install-option"><input type="radio" name="install-target" value="browser" ${ports.length ? '' : 'checked'}> ${browser}</label>
+                <h3>Wi-Fi</h3>
+                <label class="install-option"><input type="radio" name="install-target" value="ota"> Over the network (OTA) - only for an ESP32 that already runs ESP BLE Bridge firmware${controller.online ? ' (online)' : ''}.</label>
+                <p class="install-note">The first install on a new ESP32 (or one that ran older firmware) must use USB or this computer.</p>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" data-act="refresh">🔄 Refresh</button>
+                    <button class="btn btn-secondary" data-act="cancel">Cancel</button>
+                    <button class="btn btn-primary" data-act="go">Continue</button>
+                </div>
+            </div>`;
+        modal.querySelector('[data-act=refresh]').onclick = render;
+        modal.querySelector('[data-act=cancel]').onclick = () => modal.remove();
+        modal.querySelector('[data-act=go]').onclick = async () => {
+            const choice = modal.querySelector('input[name=install-target]:checked');
+            if (!choice) { showNotification('Choose where to install', 'warning'); return; }
+            modal.remove();
+            if (choice.value === 'browser') {
+                await installFromThisComputer(controllerName);
+            } else {
+                const port = choice.value === 'usb' ? choice.dataset.port : 'OTA';
+                await startFirmwareJob(controllerName, 'flash', { port }, 'Install');
+            }
+        };
+    };
+    await render();
+}
+
+async function installFromThisComputer(controllerName) {
+    let status = await (await fetch(`api/esphome/build-status/${controllerName}`)).json();
+    if (!status.up_to_date) {
+        if (!(status.job && status.job.running)) {
+            const started = await startFirmwareJob(controllerName, 'build', {}, 'Build');
+            if (!started) return;
+        }
+        showNotification('Building the firmware first; the installer opens when it is ready.', 'info');
+        const job = await waitForJob(controllerName);
+        if (!job || !job.success) return;  // pollFirmwareJob already reported the error
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.display = 'block';
+    const manifest = `api/esphome/manifest/${controllerName}`;
+    const firmware = `api/esphome/firmware/${controllerName}`;
+    if (canFlashFromBrowser()) {
+        if (!document.querySelector(`script[src="${ESP_WEB_TOOLS}"]`)) {
+            const script = document.createElement('script');
+            script.type = 'module';
+            script.src = ESP_WEB_TOOLS;
+            document.head.appendChild(script);
+        }
+        modal.innerHTML = `
+            <div class="modal-content import-modal-content">
+                <h2>⚡ Install from this computer</h2>
+                <p>Connect the ESP32 to this computer with a USB data cable, click Connect and choose its port.
+                   If no port appears, install the USB driver of your board (CP210x or CH340).</p>
+                <esp-web-install-button manifest="${manifest}">
+                    <button slot="activate" class="btn btn-success">🔌 Connect</button>
+                    <span slot="unsupported">This browser cannot flash; use Chrome or Edge.</span>
+                </esp-web-install-button>
+                <p class="install-note">Or <a href="${firmware}">download the firmware</a> and flash it with web.esphome.io.</p>
+                <div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal(this)">Close</button></div>
+            </div>`;
+    } else {
+        modal.innerHTML = `
+            <div class="modal-content import-modal-content">
+                <h2>⚡ Install from this computer</h2>
+                <ol>
+                    <li><a class="btn btn-success" href="${firmware}">💾 Download the firmware</a></li>
+                    <li>Connect the ESP32 to this computer with a USB data cable.</li>
+                    <li>Open <a href="https://web.esphome.io" target="_blank" rel="noopener">web.esphome.io</a> in Chrome or Edge,
+                        click <strong>Connect</strong>, choose the ESP32's port, then <strong>Install</strong> and pick the downloaded file.</li>
+                </ol>
+                <p class="install-note">Flashing directly from this page needs Home Assistant to be opened over HTTPS.</p>
+                <div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal(this)">Close</button></div>
+            </div>`;
+    }
+    document.body.appendChild(modal);
 }
 
 async function flashFirmware(controllerName, button = null) {
-    const port = await choosePort();
-    if (!port) return;
-    await startFirmwareJob(controllerName, 'flash', { port }, 'Install');
+    await installFirmware(controllerName, button);
 }
 
 async function buildAndFlash(controllerName, button = null) {
     await installFirmware(controllerName, button);
-}
-
-function showPortSelectionDialog(ports) {
-    return new Promise((resolve) => {
-        const modal = document.createElement('div');
-        modal.className = 'modal';
-        modal.style.display = 'block';
-        
-        const portOptions = ports.map((port, i) =>
-            `<label style="display: block; margin: 10px 0;">
-                <input type="radio" name="port" value="${port}" ${i === 0 ? 'checked' : ''}> ${port === 'OTA' ? 'Wi-Fi (OTA, controller already running ESPHome)' : 'USB: ' + port}
-            </label>`
-        ).join('');
-        
-        modal.innerHTML = `
-            <div class="modal-content">
-                <h2>Install method</h2>
-                <p>The first install on a new ESP32 has to be over USB.</p>
-                <div style="margin: 20px 0;">
-                    ${portOptions}
-                </div>
-                <div style="display: flex; gap: 10px; justify-content: flex-end;">
-                    <button class="btn btn-secondary" onclick="this.closest('.modal').remove(); window.portSelected(null)">Cancel</button>
-                    <button class="btn btn-primary" onclick="window.portSelected(document.querySelector('input[name=port]:checked').value)">Continue</button>
-                </div>
-            </div>
-        `;
-        
-        document.body.appendChild(modal);
-        
-        window.portSelected = (port) => {
-            modal.remove();
-            delete window.portSelected;
-            resolve(port);
-        };
-    });
 }
 
 // Dark mode functionality
