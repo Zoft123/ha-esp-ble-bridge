@@ -1,0 +1,19 @@
+# Python and editors
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+
+# Local ESPHome output and secrets (when testing the generator or components locally)
+.esphome/
+secrets.yaml
+
+# BRMesh exports contain the mesh key
+BRMESH_BACKUP*
+brmesh_export*.json
+
+# Built by tests/native_compare/native_compare.py
+tests/native_compare/fw_probe

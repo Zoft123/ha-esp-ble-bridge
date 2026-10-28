@@ -1,0 +1,4 @@
+# Base images per architecture; Debian trixie provides the Python 3.12+ that ESPHome needs.
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:trixie
+  amd64: ghcr.io/home-assistant/amd64-base-debian:trixie

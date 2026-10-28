@@ -1,0 +1,7 @@
+#!/usr/bin/env bashio
+# s6 service end: if the app exited with an error, stop the add-on so the Supervisor shows it as failed.
+exit_code="${1}"
+if [[ "${exit_code}" != "0" && "${exit_code}" != "256" ]]; then
+    bashio::log.error "ESP BLE Bridge stopped with exit code ${exit_code}"
+    exec /run/s6/basedir/bin/halt
+fi

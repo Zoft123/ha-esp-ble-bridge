@@ -1,11 +1,7 @@
-#!/usr/bin/env python3
-"""
-Persistent state for the add-on and the ESPHome secrets file.
+"""Persistent state of the add-on (/data/brmesh_state.json) and the ESPHome secrets file.
 
-The add-on used to write lights/controllers into /data/options.json. That file belongs to the
-Supervisor: it is rewritten (and stripped down to the schema) whenever the user saves the add-on
-options, which silently threw away every light. State now lives in /data/brmesh_state.json, and
-options.json is only read.
+The Supervisor's /data/options.json only holds the add-on options from the UI and is read, never written:
+the Supervisor rewrites it whenever the options are saved.
 """
 import copy
 import json
@@ -21,11 +17,6 @@ STATE_PATH = '/data/brmesh_state.json'
 ESPHOME_DIR = '/config/esphome'
 # ESPHome resolves `!secret` from secrets.yaml next to the device YAML, so this is the file that matters.
 ESPHOME_SECRETS_PATH = os.path.join(ESPHOME_DIR, 'secrets.yaml')
-HA_SECRETS_PATH = '/config/secrets.yaml'
-
-# Secrets that older versions only wrote into Home Assistant's secrets.yaml.
-MIGRATED_SECRETS = ('mesh_key', 'wifi_ssid', 'wifi_password', 'wifi_domain', 'api_encryption_key',
-                    'ota_password', 'default_wifi_network')
 
 DEFAULT_STATE: Dict[str, Any] = {
     'version': 2,
@@ -34,15 +25,12 @@ DEFAULT_STATE: Dict[str, Any] = {
     'controllers': [],
     'groups': [],
     'scenes': [],
-    'ignored_devices': [],
     'settings': {
         'map_enabled': True,
         'latitude': 0.0,
         'longitude': 0.0,
         'zoom': 19,
         'generate_esphome_configs': True,
-        'enable_nspanel_ui': False,
-        'nspanel_entity_id': '',
         # BLE advertising parameters passed to the fastcon component
         'adv_interval_min': 0x20,
         'adv_interval_max': 0x28,
@@ -84,10 +72,7 @@ class StateStore:
 
     def _load(self) -> Dict[str, Any]:
         state = copy.deepcopy(DEFAULT_STATE)
-        stored = self._read_json(self.path)
-        if stored is None:
-            stored = self._migrate_from_options()
-        for key, value in stored.items():
+        for key, value in (self._read_json(self.path) or {}).items():
             if key == 'settings' and isinstance(value, dict):
                 state['settings'].update(value)
             else:
@@ -95,38 +80,12 @@ class StateStore:
         state['lights'] = [l for l in (self._normalize_light(l) for l in state.get('lights') or []) if l]
         return state
 
-    def _migrate_from_options(self) -> Dict[str, Any]:
-        """Pick up lights/controllers that older versions stored in options.json."""
-        old = self.options
-        migrated: Dict[str, Any] = {}
-        for key in ('mesh_key', 'controllers', 'scenes', 'ignored_devices'):
-            if old.get(key):
-                migrated[key] = old[key]
-        lights = old.get('lights')
-        if isinstance(lights, dict):  # very old versions: {"1": {...}}
-            lights = [dict(v, light_id=int(k)) for k, v in lights.items()]
-        if lights:
-            migrated['lights'] = lights
-        settings = {}
-        for old_key, new_key in (('map_enabled', 'map_enabled'), ('latitude', 'latitude'), ('longitude', 'longitude'),
-                                 ('map_latitude', 'latitude'), ('map_longitude', 'longitude'), ('zoom', 'zoom'),
-                                 ('generate_esphome_configs', 'generate_esphome_configs'),
-                                 ('enable_nspanel_ui', 'enable_nspanel_ui'), ('nspanel_entity_id', 'nspanel_entity_id')):
-            if old_key in old and old[old_key] not in (None, ''):
-                settings[new_key] = old[old_key]
-        if settings:
-            migrated['settings'] = settings
-        if migrated:
-            logger.info(f"Migrated {len(migrated.get('lights', []))} lights and "
-                        f"{len(migrated.get('controllers', []))} controllers from options.json")
-        return migrated
-
     @staticmethod
     def _normalize_light(light: Dict) -> Dict:
-        """Accept the different shapes older versions wrote (light_id / address / id)."""
+        """A stored light with every field the add-on expects, or None if it has no valid light ID."""
         if not isinstance(light, dict):
             return None
-        light_id = light.get('light_id', light.get('address', light.get('id')))
+        light_id = light.get('light_id')
         try:
             light_id = int(light_id)
         except (TypeError, ValueError):
@@ -139,8 +98,6 @@ class StateStore:
         out.setdefault('supports_cwww', False)
         out.setdefault('color_interlock', True)
         out.setdefault('location', {'x': None, 'y': None})
-        for stale in ('address', 'id', 'state', 'signal_strength', 'paired'):
-            out.pop(stale, None)
         return out
 
     def save(self) -> None:
@@ -194,15 +151,3 @@ class StateStore:
             buf = StringIO()
             self._yaml().dump(secrets, buf)
             _atomic_write(ESPHOME_SECRETS_PATH, buf.getvalue())
-
-    def migrate_secrets(self) -> None:
-        """Copy secrets that older versions only wrote to Home Assistant's secrets.yaml."""
-        ha = self.read_secrets(HA_SECRETS_PATH) if os.path.abspath(HA_SECRETS_PATH) != os.path.abspath(ESPHOME_SECRETS_PATH) else {}
-        if not ha:
-            return
-        current = self.read_secrets()
-        missing = {k: v for k, v in ha.items()
-                   if (k in MIGRATED_SECRETS or str(k).startswith('wifi_network_')) and k not in current}
-        if missing:
-            self.update_secrets({k: (str(v) if not isinstance(v, (int, bool)) else v) for k, v in missing.items()})
-            logger.info(f"Copied {len(missing)} secrets from /config/secrets.yaml to {ESPHOME_SECRETS_PATH}")

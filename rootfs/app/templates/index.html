@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP BLE Bridge</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%232f6fde%27/%3E%3Cpath d=%27M16 6l3 7 7 3-7 3-3 7-3-7-7-3 7-3z%27 fill=%27white%27/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="static/css/style.css?v={{ addon_version }}">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+  <script src="static/js/app.js?v={{ addon_version }}" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">✦</span>
+      <div>
+        <h1>ESP BLE Bridge</h1>
+        <div class="muted small">v{{ addon_version }} · firmware {{ version }}</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn danger" id="stop-effects" hidden>⏹ Stop effects</button>
+      <button class="btn" data-action="open-import">📱 Import BRMesh export</button>
+      <button class="btn icon" id="theme-toggle" title="Switch light/dark">◐</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="lights" aria-selected="true">Lights</button>
+    <button role="tab" data-tab="pairing">Pairing</button>
+    <button role="tab" data-tab="controllers">Controllers</button>
+    <button role="tab" data-tab="effects">Effects</button>
+    <button role="tab" data-tab="scenes">Scenes</button>
+    <button role="tab" data-tab="map">Map</button>
+    <button role="tab" data-tab="settings">Settings</button>
+  </nav>
+
+  <main>
+    <!-- Lights -->
+    <section class="panel" id="tab-lights">
+      <div class="toolbar">
+        <span class="label">All lights</span>
+        <button class="btn small" data-action="all-on">On</button>
+        <button class="btn small" data-action="all-off">Off</button>
+        <div class="chips" id="all-presets"></div>
+      </div>
+      <div class="notice" id="lights-empty" hidden>
+        No lights yet. <button class="link" data-action="open-import">Import your BRMesh export</button>
+        or pair new lamps in the <button class="link" data-goto="pairing">Pairing</button> tab.
+      </div>
+      <div class="grid" id="light-grid"></div>
+    </section>
+
+    <!-- Pairing -->
+    <section class="panel" id="tab-pairing" hidden>
+      <h2>Pair new lamps</h2>
+      <ol class="steps">
+        <li>Reset the lamps you want to add, as you would before pairing them with the BRMesh app
+          (for most lamps: switch the power off and on 5 times, about a second each, until it blinks).
+          Lamps that are paired with the app have to be reset first.</li>
+        <li>Choose the controller closest to the lamps and start pairing. For two minutes it looks for reset lamps
+          and gives each a free light ID and your mesh key.</li>
+        <li>Paired lamps appear under Lights. Install the firmware on your controllers afterwards so Home Assistant
+          gets the new light entities.</li>
+      </ol>
+      <div class="toolbar">
+        <label class="label" for="pairing-controller">Controller</label>
+        <select id="pairing-controller"></select>
+        <button class="btn primary" id="pairing-start">Start pairing</button>
+        <button class="btn danger" id="pairing-stop" hidden>Stop</button>
+      </div>
+      <p class="status-line" id="pairing-status"></p>
+      <div class="table-wrap"><table class="table" id="pairing-table" hidden></table></div>
+      <p class="muted small">Needs controller firmware 2.1.0 or newer. Lamps paired here do not show up in the BRMesh
+        app, and the app does not know which IDs were handed out here; if you also pair with the app, import its export
+        first. Lamps that answer with the app's extended protocol are listed but cannot be paired yet.</p>
+    </section>
+
+    <!-- Controllers -->
+    <section class="panel" id="tab-controllers" hidden>
+      <div class="section-head">
+        <h2>ESP32 controllers</h2>
+        <div class="row">
+          <button class="btn" data-action="regenerate">Regenerate configs</button>
+          <button class="btn primary" data-action="new-controller">＋ New controller</button>
+        </div>
+      </div>
+      <div class="grid wide" id="controller-grid"></div>
+      <div class="output-box" id="output-box" hidden>
+        <div class="section-head">
+          <h3 id="output-title">Build output</h3>
+          <button class="btn small" data-action="close-output">Close</button>
+        </div>
+        <pre id="output-text"></pre>
+      </div>
+    </section>
+
+    <!-- Effects -->
+    <section class="panel" id="tab-effects" hidden>
+      <h2>Effects</h2>
+      <p class="muted">Pick the lights, then an effect. Setting a light on the Lights tab, or switching it off anywhere
+        in Home Assistant, takes it out of its effect.</p>
+      <div class="toolbar">
+        <span class="label">Lights</span>
+        <button class="btn small" data-action="effect-select-all">All</button>
+        <button class="btn small" data-action="effect-select-none">None</button>
+      </div>
+      <div class="checklist" id="effect-lights"></div>
+      <div class="grid compact" id="effect-list"></div>
+      <div class="section-head">
+        <h3>Running</h3>
+        <button class="btn small danger" data-action="stop-all-effects">Stop all</button>
+      </div>
+      <ul class="list" id="running-effects"></ul>
+    </section>
+
+    <!-- Scenes -->
+    <section class="panel" id="tab-scenes" hidden>
+      <div class="section-head">
+        <h2>Scenes</h2>
+        <button class="btn primary" data-action="new-scene">＋ New scene</button>
+      </div>
+      <div class="grid compact" id="scene-grid"></div>
+      <p class="muted" id="scenes-empty" hidden>No scenes yet. A scene stores a color per light, or starts an effect.</p>
+    </section>
+
+    <!-- Map -->
+    <section class="panel" id="tab-map" hidden>
+      <div class="map-layout">
+        <div id="map"></div>
+        <aside class="map-side">
+          <h3>Not on the map</h3>
+          <p class="muted small">Click an item to drop it in the middle of the map, then drag it to its place.
+            Positions are saved when you let go.</p>
+          <ul class="list" id="unplaced"></ul>
+        </aside>
+      </div>
+      <p class="muted small" id="map-disabled" hidden>The map is turned off in Settings.</p>
+    </section>
+
+    <!-- Settings -->
+    <section class="panel" id="tab-settings" hidden>
+      <form id="settings-form" class="settings">
+        <fieldset>
+          <legend>Mesh</legend>
+          <label for="set-mesh-key">Mesh key (8 hex characters, from your BRMesh export)</label>
+          <div class="row">
+            <input id="set-mesh-key" name="mesh_key" type="password" maxlength="8" autocomplete="off" spellcheck="false">
+            <button type="button" class="btn" data-action="toggle-key">Show</button>
+            <button type="button" class="btn" data-action="random-key">Random</button>
+          </div>
+          <p class="muted small">Changing the key means every lamp has to be paired again with the new key.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Wi-Fi networks for controllers</legend>
+          <ul class="list" id="wifi-list"></ul>
+          <button type="button" class="btn" data-action="add-wifi">＋ Add network</button>
+          <p class="muted small">Stored in /config/esphome/secrets.yaml.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Controller firmware</legend>
+          <label class="check"><input type="checkbox" name="generate_esphome"> Write the controllers' ESPHome configuration automatically</label>
+          <label class="check"><input type="checkbox" name="include_all_lights_entity"> "All Lights" entity (one packet for every lamp)</label>
+          <label class="check"><input type="checkbox" name="enable_web_server"> Web server on the ESP32 (costs memory; off is recommended)</label>
+          <div class="two">
+            <label>Advertising time per packet (ms)<input type="number" name="adv_duration" min="20" max="500"></label>
+            <label>Repeats per command<input type="number" name="adv_repeats" min="1" max="10"></label>
+          </div>
+          <p class="muted small">Raise these if lamps far from the ESP32 miss commands. Reinstall the controllers after changing them.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Map</legend>
+          <label class="check"><input type="checkbox" name="map_enabled"> Show the map</label>
+          <div class="three">
+            <label>Latitude<input type="number" step="0.000001" name="latitude"></label>
+            <label>Longitude<input type="number" step="0.000001" name="longitude"></label>
+            <label>Zoom<input type="number" min="3" max="20" name="zoom"></label>
+          </div>
+          <div class="row">
+            <input id="address-query" type="search" placeholder="Find an address">
+            <button type="button" class="btn" data-action="find-address">Find</button>
+          </div>
+          <ul class="list" id="address-results"></ul>
+        </fieldset>
+
+        <div class="row">
+          <button type="submit" class="btn primary">Save settings</button>
+          <button type="button" class="btn" data-action="reset-settings">Defaults</button>
+        </div>
+
+        <fieldset>
+          <legend>Backup</legend>
+          <div class="row">
+            <a class="btn" href="api/settings/export" download>Download configuration</a>
+            <button type="button" class="btn" data-action="open-import">Import BRMesh export</button>
+          </div>
+        </fieldset>
+
+        <fieldset class="danger-zone">
+          <legend>Danger zone</legend>
+          <p class="muted small">Removes every light, controller and scene from the add-on and deletes the controllers'
+            configuration files. Settings and Wi-Fi networks are kept.</p>
+          <button type="button" class="btn danger" data-action="system-reset">Remove everything</button>
+        </fieldset>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="dialog"><form method="dialog" id="dialog-body"></form></dialog>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

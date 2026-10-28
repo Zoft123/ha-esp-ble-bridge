@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bashio
+# s6 service: the ESP BLE Bridge web UI and API.
+bashio::log.info "ESP BLE Bridge is starting"
+exec python3 /app/brmesh_bridge.py

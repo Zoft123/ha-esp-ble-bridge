@@ -1,19 +1,19 @@
 # Authorship and licensing
 
-ESP BLE Bridge combines work by several people, under different terms. The [MIT license](LICENSE) covers
-the work of Zoft123; the parts below that come from other authors keep their own terms.
+ESP BLE Bridge is licensed under the [MIT license](LICENSE), Copyright (c) 2026 Zoft123, with the exception of
+the FastCon component code described below, which carries its own MIT license.
 
-## Original project: Chris Valentino (@tofuweasel)
+## Origins: Chris Valentino (@tofuweasel)
 
-ESP BLE Bridge was created by **Chris Valentino** ([@tofuweasel](https://github.com/tofuweasel)) as
+This project grew out of ESP BLE Bridge by **Chris Valentino**
+([@tofuweasel](https://github.com/tofuweasel)), published as
 [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge) (November 2025, up to
-version 0.50.11). This repository continues that project; its history up to 0.50.11 is his work.
+version 0.50.11) without a license. Credit for the original idea and project is his.
 
-The original repository was published **without a license**. Code and files written by Chris Valentino that
-remain here are © Chris Valentino, and the MIT license in [LICENSE](LICENSE) does not apply to them. This
-includes much of the web UI (`rootfs/app/static/`, `rootfs/app/templates/index.html`) and
-`rootfs/app/nspanel_ui.py`. `git blame` shows the author of every line. (His standalone research scripts were
-removed from this repository; they remain in his original repository.)
+Since version 0.62.0 none of his code or files are part of this repository's current version: the web UI,
+the add-on code and the repository files were rewritten or removed, and his standalone research scripts were
+removed. His work remains available in his repository, and in this repository's git history up to version
+0.50.11.
 
 ## FastCon ESPHome components
 
@@ -24,11 +24,6 @@ The components in `esphome_components/` are based on
 [@scross01](https://github.com/scross01/esphome-fastcon). MIT License, Copyright (c) 2025 Dennis George: see
 [esphome_components/LICENSE.fastcon](esphome_components/LICENSE.fastcon). Changes made here (command
 scheduler, pairing, light state encoding, broadcast and group fixes) are by Zoft123 under the same terms.
-
-## Zoft123
-
-Everything added or rewritten by Zoft123 from version 0.60.0 on (BRMesh export importer, ESPHome generator
-and builder, Home Assistant control, pairing, presets, effects engine, tests): MIT, see [LICENSE](LICENSE).
 
 ## BRMesh protocol
 
