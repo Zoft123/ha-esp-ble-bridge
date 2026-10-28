@@ -93,7 +93,7 @@ async def to_code(config):
     cg.add(var.set_repeats(config[CONF_REPEATS]))
 
     if not hasattr(esp32_ble, "register_gap_scan_event_handler"):
-        raise cv.Invalid("Pairing needs a newer ESPHome (esp32_ble scan handler API); update ESPHome")
+        raise cv.Invalid("These components need ESPHome 2026.10 or newer (esp32_ble callback API)")
     ble = await cg.get_variable(config[esp32_ble.CONF_BLE_ID])
     esp32_ble.register_gap_event_handler(ble, var)
     esp32_ble.register_gap_scan_event_handler(ble, var)

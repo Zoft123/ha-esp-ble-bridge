@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ADDON_VERSION = '0.61.0'
+ADDON_VERSION = '0.61.1'
 
 class BRMeshBridge:
     def __init__(self):

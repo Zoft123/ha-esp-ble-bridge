@@ -1,5 +1,5 @@
 name: ESP BLE Bridge
-version: 0.61.0
+version: 0.61.1
 
 slug: esp-ble-bridge
 description: Control BRMesh/FastCon BLE lights from Home Assistant through ESP32 controllers, set up from your BRMesh app export

@@ -5,6 +5,13 @@ All notable changes to the ESP BLE Bridge add-on will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.61.1] - 2026-10-28
+
+### Changed
+- **ESPHome 2026.10.1** builds the controller firmware (was 2025.10.3), on a Debian trixie base image
+  (Python 3.13). The pairing scan uses ESPHome's current BLE event API, so 0.61.0 could not build its own
+  firmware. The first build after updating downloads the newer ESP32 toolchain and takes longer.
+
 ## [0.61.0] - 2026-10-28
 
 Controller firmware 2.1.0: install it on every controller (Controllers tab) after updating.

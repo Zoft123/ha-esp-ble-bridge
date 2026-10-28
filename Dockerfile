@@ -1,4 +1,4 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:trixie
 FROM ${BUILD_FROM}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -14,11 +14,12 @@ RUN apt-get update \
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# ESPHome is pinned to the version the bundled components were compiled with.
+# ESPHome is pinned to the version the bundled components were compiled with. 2026.10 needs Python 3.12+
+# (Debian trixie) and has the esp32_ble callback API the pairing scan uses.
 RUN python3 -m venv /opt/venv \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
-        "esphome==2025.10.3" \
+        "esphome==2026.10.1" \
         "flask>=3.0.0,<4.0.0" \
         "waitress>=3.0.0,<4.0.0" \
         "ruamel.yaml>=0.17.0,<1.0.0" \
