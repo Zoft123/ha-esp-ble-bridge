@@ -21,6 +21,10 @@ class FakeHA:
     def states(self, max_age=5.0):
         return self._states
 
+    def controller_entities(self, name):
+        # Like the device lookup: the device's entities, whatever their entity IDs look like.
+        return [st for st in self._states if str(st['attributes'].get('friendly_name', '')).startswith(name)]
+
     def call_service(self, domain, service, data, timeout=10):
         self.calls.append((domain, service, data))
         return True
@@ -75,6 +79,14 @@ class PairingTest(unittest.TestCase):
         b = self.make('off|')
         status = b.pairing_status({'name': 'Other ESP'})
         self.assertFalse(status['available'])
+
+    def test_area_prefixed_entity_ids(self):
+        b = self.make('off|')
+        b.ha._states = [{'entity_id': 'sensor.network_closet_esp_ble_bridge_pairing', 'state': 'on|9,a1b2c3d4e5f6,43050,ok;',
+                         'attributes': {'friendly_name': 'esp-ble-bridge Pairing'}}]
+        status = b.pairing_status({'name': 'esp-ble-bridge'})
+        self.assertTrue(status['available'])
+        self.assertEqual(status['added'], [9])
 
     def test_garbage_entries_are_ignored(self):
         b = self.make('on|x,y;3,abc;;7,a1b2c3d4e5f6,43050,ok')

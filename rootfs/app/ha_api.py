@@ -6,6 +6,7 @@ The ESP32 controllers expose the lights to Home Assistant through the ESPHome in
 add-on's dashboard, scenes and effects drive those light entities instead of keeping a second,
 disconnected copy of every light.
 """
+import json
 import logging
 import os
 import re
@@ -106,6 +107,24 @@ class HomeAssistantAPI:
         self.states()
         return self._by_id.get(entity_id)
 
+    def device_entity_ids(self, device_name: str) -> List[str]:
+        """Entity IDs of the ESPHome device named `device_name`, whatever Home Assistant named the entities
+        (it adds the area, e.g. "network_closet_", and users rename them)."""
+        template = ("{{ integration_entities('esphome') | select('is_device_attr', 'name', %s) | list | tojson }}"
+                    % json.dumps(device_name))
+        try:
+            r = self.session.post(f'{CORE_URL}/template', json={'template': template}, timeout=5)
+            r.raise_for_status()
+            return list(json.loads(r.text))
+        except Exception as e:
+            logger.debug(f"Device lookup for {device_name} failed: {e}")
+            return []
+
     def controller_entities(self, controller_name: str) -> List[Dict]:
+        """States of a controller's entities: by its ESPHome device, else by the default entity ID prefix."""
+        states = self.states()
+        ids = set(self.device_entity_ids(controller_name)) if self.available else set()
+        if ids:
+            return [s for s in states if s.get('entity_id') in ids]
         prefix = slugify(controller_name) + '_'
-        return [s for s in self.states() if s.get('entity_id', '').split('.', 1)[-1].startswith(prefix)]
+        return [s for s in states if s.get('entity_id', '').split('.', 1)[-1].startswith(prefix)]

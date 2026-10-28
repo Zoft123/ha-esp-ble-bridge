@@ -1,6 +1,6 @@
 # Home Assistant add-on (app) definition.
 name: ESP BLE Bridge
-version: 0.62.0
+version: 0.62.1
 slug: esp-ble-bridge
 description: Control BRMesh/FastCon Bluetooth lights from Home Assistant through ESP32 controllers, and pair new lamps without the phone app
 url: https://github.com/Zoft123/ha-esp-ble-bridge

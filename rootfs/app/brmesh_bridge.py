@@ -21,7 +21,7 @@ from state_store import StateStore
 basicConfig(level=INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = getLogger('esp_ble_bridge')
 
-ADDON_VERSION = '0.62.0'
+ADDON_VERSION = '0.62.1'
 
 
 class BRMeshBridge:
@@ -283,9 +283,9 @@ class BRMeshBridge:
 
         The sensor reads "on|<light id>,<device id>,<type>,<state>;..." (state ok, wait, nofree or unsup).
         """
-        prefix = f"sensor.{controller_slug(controller['name']).replace('-', '_')}_"
-        entity = next((s for s in self.ha.states(max_age=1.0)
-                       if s.get('entity_id', '').startswith(prefix) and
+        self.ha.states(max_age=1.0)
+        entity = next((s for s in self.ha.controller_entities(controller['name'])
+                       if s.get('entity_id', '').startswith('sensor.') and
                        str(s.get('attributes', {}).get('friendly_name', '')).endswith(PAIRING_SENSOR_NAME)), None)
         if entity is None:
             return {'available': False, 'active': False, 'lamps': [], 'added': []}

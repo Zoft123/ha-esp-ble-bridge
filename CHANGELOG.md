@@ -4,6 +4,14 @@ What changed in each version of ESP BLE Bridge, newest first. Versions follow [S
 Releases before 0.60.0 belong to the original project by Chris Valentino; their history is in
 [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge).
 
+## [0.62.1] - 2026-10-28
+
+### Fixed
+- Controllers showed as **Offline** (and the Pairing tab reported no pairing sensor) when Home Assistant's
+  entity IDs did not start with the controller's name, e.g. with the area prefixed
+  (`binary_sensor.network_closet_esp_ble_bridge_status`). The add-on now finds a controller's entities
+  through its ESPHome device.
+
 ## [0.62.0] - 2026-10-28
 
 Nothing from the original project's code is left: the web UI and every file that still contained it were
