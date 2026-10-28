@@ -138,10 +138,19 @@ See the [changelog](CHANGELOG.md) for what changed in each version.
 
 ## Credits
 
-- The ESPHome components are based on [esphome-fastcon](https://github.com/scross01/esphome-fastcon) by
-  [@scross01](https://github.com/scross01), MIT licensed (see `esphome_components/LICENSE.fastcon`).
-- This repository started as a fork of
-  [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge).
+- **Chris Valentino** ([@tofuweasel](https://github.com/tofuweasel)) created ESP BLE Bridge:
+  [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge). This project continues his
+  work, and much of the web UI is still his. Thank you, Chris!
+- The ESPHome components build on [esphome-fastcon](https://github.com/dennispg/esphome-fastcon) by
+  **Dennis George** ([@dennispg](https://github.com/dennispg)), via the forks of
+  [@brett-todd](https://github.com/brett-todd/esphome-fastcon) and
+  [@scross01](https://github.com/scross01/esphome-fastcon).
+
+## License
+
+MIT for this project's own code: see [LICENSE](LICENSE). Parts by other authors keep their own terms; in
+particular the original project by Chris Valentino was published without a license, so his code that remains
+here is not covered by the MIT license. [NOTICE.md](NOTICE.md) lists who wrote what.
 
 ## Issues
 
