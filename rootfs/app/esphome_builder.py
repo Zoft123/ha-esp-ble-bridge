@@ -148,8 +148,9 @@ class ESPHomeBuilder:
 
     def find_firmware_binary(self, controller_name: str, factory: bool = True) -> Optional[str]:
         name = controller_slug(controller_name)
-        base = f"{self.build_dir}/.esphome/build/{name}/.pioenvs/{name}"
-        candidates = ([f"{base}/firmware.factory.bin"] if factory else []) + [f"{base}/firmware.bin"]
+        # ESPHome 2026 builds with native ESP-IDF into .esphome/build/<name>/build.
+        base = f"{self.build_dir}/.esphome/build/{name}/build"
+        candidates = ([f"{base}/firmware.factory.bin"] if factory else []) + [f"{base}/firmware.ota.bin"]
         for path in candidates:
             if os.path.exists(path):
                 return path
