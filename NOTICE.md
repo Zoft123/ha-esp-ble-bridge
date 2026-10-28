@@ -11,9 +11,9 @@ version 0.50.11). This repository continues that project; its history up to 0.50
 
 The original repository was published **without a license**. Code and files written by Chris Valentino that
 remain here are © Chris Valentino, and the MIT license in [LICENSE](LICENSE) does not apply to them. This
-includes much of the web UI (`rootfs/app/static/`, `rootfs/app/templates/index.html`),
-`rootfs/app/nspanel_ui.py`, and the research scripts in the repository root. `git blame` shows the author
-of every line.
+includes much of the web UI (`rootfs/app/static/`, `rootfs/app/templates/index.html`) and
+`rootfs/app/nspanel_ui.py`. `git blame` shows the author of every line. (His standalone research scripts were
+removed from this repository; they remain in his original repository.)
 
 ## FastCon ESPHome components
 
