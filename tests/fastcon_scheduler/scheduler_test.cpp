@@ -9,6 +9,9 @@ static std::vector<uint8_t> cur;
 esp_err_t esp_ble_gap_config_adv_data_raw(uint8_t *d, uint32_t n) { cur.assign(d + 7, d + n); return 0; }
 esp_err_t esp_ble_gap_start_advertising(esp_ble_adv_params_t *) { sent.push_back(cur); return 0; }
 esp_err_t esp_ble_gap_stop_advertising() { return 0; }
+esp_err_t esp_ble_gap_set_scan_params(esp_ble_scan_params_t *) { return 0; }
+esp_err_t esp_ble_gap_start_scanning(uint32_t) { return 0; }
+esp_err_t esp_ble_gap_stop_scanning() { return 0; }
 using esphome::g_now;
 struct Ctl : esphome::fastcon::FastconController {};
 static std::vector<uint8_t> P(uint8_t t, uint8_t v) { return {t, v}; }

@@ -11,7 +11,7 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from brmesh_export import ExportError, mask_key, parse_export, select_mesh
-from effects import EFFECTS
+from effects import EFFECTS, PRESETS, kelvin_to_rgb
 from esphome_generator import BRIDGE_FIRMWARE_VERSION, LIGHTS_PER_CONTROLLER_WARNING, controller_slug
 
 logger = logging.getLogger(__name__)
@@ -20,14 +20,6 @@ app = Flask(__name__, static_folder='/app/static', template_folder='/app/templat
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # Exports are small; refuse anything that is clearly not one.
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-
-PAIRING_UNSUPPORTED = (
-    "Pairing new lights from the ESP32 is not supported. Reset lights do not advertise on their own: "
-    "the BRMesh app first broadcasts a scan request and answers with a pairing packet built by its "
-    "native library (libbroadlink_ble.so), which has not been reverse engineered. Pair the lights "
-    "with the BRMesh app, then upload its export (Import from BRMesh App) - the ESP32 controls them "
-    "with the mesh key and light IDs from that file."
-)
 
 
 def error(message, status=400, **extra):
@@ -59,6 +51,26 @@ class WebUI:
             'state': self.bridge.light_state(light_id),
             'location': light.get('location') or {'x': None, 'y': None},
         }
+
+    def _apply_light_request(self, light_ids, data):
+        """Set lights from a web UI request: a preset, a white color temperature or an RGB color.
+
+        Lights set by hand leave any effect they were running.
+        """
+        bridge = self.bridge
+        brightness = int(data['brightness']) if data.get('brightness') is not None else None
+        state = bool(data.get('state', True))
+        preset = PRESETS.get(str(data.get('preset') or ''))
+        if data.get('preset') and not preset:
+            raise ValueError(f"Unknown preset: {data['preset']}")
+        kelvin = (preset or {}).get('kelvin') or (int(data['kelvin']) if data.get('kelvin') else None)
+        rgb = None
+        if kelvin is None:
+            rgb = (preset or {}).get('rgb') or data.get('rgb')
+            if rgb is not None:
+                rgb = tuple(int(c) for c in rgb)
+        bridge.effects.release_lights(light_ids)
+        return bridge.set_lights(light_ids, rgb, brightness, state, kelvin=kelvin)
 
     def _clean_light_ids(self, value):
         """None means every light; otherwise a sorted list of known light IDs."""
@@ -122,11 +134,45 @@ class WebUI:
             if light_id not in bridge.lights:
                 return error('Light not found', 404)
             data = request.get_json(silent=True) or {}
-            ok = bridge.set_light_color(light_id, tuple(data.get('rgb', [255, 255, 255])),
-                                        int(data.get('brightness', 255)), bool(data.get('state', True)))
+            try:
+                ok = self._apply_light_request([light_id], data)
+            except (TypeError, ValueError) as e:
+                return error(str(e))
             if not ok:
                 return error("Home Assistant has no entity for this light yet. Flash the controller and add it "
                              "in Settings → Devices & Services → ESPHome.", 409)
+            return jsonify({'success': True})
+
+        @app.route('/api/lights/bulk', methods=['POST'])
+        def control_lights():
+            """Set several lights at once; no light_ids means every light."""
+            data = request.get_json(silent=True) or {}
+            ids = self._clean_light_ids(data.get('light_ids'))
+            ids = sorted(bridge.lights) if ids is None else [i for i in ids if i in bridge.lights]
+            if not ids:
+                return error('No lights selected')
+            try:
+                ok = self._apply_light_request(ids, data)
+            except (TypeError, ValueError) as e:
+                return error(str(e))
+            if not ok:
+                return error("Home Assistant has no entities for these lights yet. Flash the controller and add "
+                             "it in Settings → Devices & Services → ESPHome.", 409)
+            return jsonify({'success': True})
+
+        @app.route('/api/presets')
+        def list_presets():
+            return jsonify([{'id': k, 'label': p['label'], 'kelvin': p.get('kelvin'),
+                             'rgb': list(p['rgb']) if p.get('rgb') else None,
+                             'swatch': list(p.get('rgb') or kelvin_to_rgb(p['kelvin']))} for k, p in PRESETS.items()])
+
+        @app.route('/api/lights/<int:light_id>/identify', methods=['POST'])
+        def identify_light(light_id):
+            if light_id not in bridge.lights:
+                return error('Light not found', 404)
+            bridge.effects.release_lights([light_id])
+            if not bridge.identify(light_id):
+                return error("Home Assistant has no entity for this light yet.", 409)
             return jsonify({'success': True})
 
         @app.route('/api/lights/<int:light_id>', methods=['PUT'])
@@ -496,51 +542,66 @@ class WebUI:
             return jsonify({'success': True, 'applied': True, 'preview': preview, 'result': result,
                             'needs_install': bool(bridge.controllers)})
 
+        # --- pairing reset lamps through a controller ------------------------
+
+        def pairing_controller():
+            data = {**request.args, **(request.get_json(silent=True) or {})}
+            controller = self._controller(data.get('controller')) if data.get('controller') else \
+                (bridge.controllers[0] if bridge.controllers else None)
+            return controller, data
+
+        @app.route('/api/pairing/start', methods=['POST'])
+        def start_pairing():
+            controller, data = pairing_controller()
+            if not controller:
+                return error('Add an ESP32 controller first (Controllers tab)')
+            if not bridge.mesh_key:
+                return error('Set a mesh key first (import your BRMesh export, or generate one in Settings)')
+            try:
+                seconds = max(10, min(600, int(data.get('seconds') or 120)))
+                ok = bridge.start_pairing(controller, seconds)
+            except ValueError as e:
+                return error(str(e))
+            if not ok:
+                return error(f"{controller['name']} did not accept the pairing request. Install the current firmware "
+                             f"on it (Controllers tab), and make sure it is online in Home Assistant.", 409)
+            return jsonify({'success': True, 'controller': controller['name'], 'seconds': seconds,
+                            'free_ids': len(bridge.free_light_ids())})
+
+        @app.route('/api/pairing/stop', methods=['POST'])
+        def stop_pairing():
+            controller, _ = pairing_controller()
+            if not controller:
+                return error('Controller not found', 404)
+            bridge.stop_pairing(controller)
+            return jsonify({'success': True})
+
+        @app.route('/api/pairing/status')
+        def pairing_status():
+            controller, _ = pairing_controller()
+            if not controller:
+                return error('Controller not found', 404)
+            return jsonify({'success': True, 'controller': controller['name'], **bridge.pairing_status(controller)})
+
+        @app.route('/api/pairing/add', methods=['POST'])
+        def add_paired_light():
+            """Add a lamp whose pairing was not confirmed by a heartbeat (it may still have joined)."""
+            data = request.get_json(silent=True) or {}
+            try:
+                light_id, type_code = int(data['light_id']), int(data.get('type_code') or 0)
+            except (KeyError, TypeError, ValueError):
+                return error('light_id is required')
+            if not 1 <= light_id <= 255 or light_id in bridge.lights:
+                return error(f'Light ID {light_id} is not free')
+            if not bridge.add_paired_light(light_id, str(data.get('did') or ''), type_code):
+                return error('This device is not a light the add-on can control')
+            bridge.lights_changed()
+            return jsonify({'success': True})
+
         @app.route('/api/import/app', methods=['POST'])
         @app.route('/api/settings/import-app', methods=['POST'])
         def import_from_app_legacy():
             return error('Upload the export file from the BRMesh app with "Import from BRMesh App".', 400)
-
-        @app.route('/api/scan', methods=['POST'])
-        @app.route('/api/pairing/discover', methods=['GET'])
-        def scan_for_lights():
-            return error(PAIRING_UNSUPPORTED, 501)
-
-        @app.route('/api/pairing/pair', methods=['POST'])
-        def pair_device():
-            return error(PAIRING_UNSUPPORTED, 501)
-
-        @app.route('/api/pairing/ignore', methods=['POST', 'DELETE'])
-        def ignore_device():
-            mac = (request.get_json(silent=True) or {}).get('mac')
-            if not mac:
-                return error('MAC address required')
-            ignored = bridge.store.data.setdefault('ignored_devices', [])
-            if request.method == 'POST' and mac not in ignored:
-                ignored.append(mac)
-            elif request.method == 'DELETE' and mac in ignored:
-                ignored.remove(mac)
-            bridge.save_config()
-            return jsonify({'success': True, 'ignored_devices': ignored})
-
-        @app.route('/api/control/send', methods=['POST'])
-        def send_control_command():
-            """Test buttons: switch a configured light through Home Assistant."""
-            data = request.get_json(silent=True) or {}
-            try:
-                light_id = int(data.get('address'))
-            except (TypeError, ValueError):
-                return error('Address is required')
-            if light_id not in bridge.lights:
-                return error(f'Light {light_id} is not configured')
-            payload = str(data.get('payload', '')).lower()
-            on = payload not in ('00', '0', 'off')
-            brightness = 255
-            if len(payload) >= 4 and payload.startswith('01'):
-                brightness = max(1, int(payload[2:4], 16) * 255 // 100)
-            ok = bridge.set_light_color(light_id, (255, 255, 255), brightness, on)
-            return (jsonify({'success': True}) if ok else
-                    error('No Home Assistant entity for this light yet', 409))
 
         # --- effects & scenes ----------------------------------------------
 
@@ -557,14 +618,18 @@ class WebUI:
                 return error(str(e))
             return jsonify({'success': True, 'effect_id': effect_id})
 
+        @app.route('/api/effects/running')
+        def running_effects():
+            return jsonify(bridge.effects.running())
+
         @app.route('/api/effects/stop', methods=['POST'])
         def stop_effects():
             effect_id = (request.get_json(silent=True) or {}).get('effect_id')
             if effect_id:
-                bridge.effects.stop_effect(effect_id)
+                stopped = 1 if bridge.effects.stop_effect(effect_id) else 0
             else:
-                bridge.effects.stop_all()
-            return jsonify({'success': True})
+                stopped = bridge.effects.stop_all()
+            return jsonify({'success': True, 'stopped': stopped})
 
         @app.route('/api/scenes')
         def list_scenes():
@@ -586,7 +651,10 @@ class WebUI:
             scene = next((s for s in bridge.store.data.get('scenes', []) if s.get('name') == scene_name), None)
             if not scene:
                 return error('Scene not found', 404)
-            bridge.effects.apply_scene(scene)
+            try:
+                bridge.effects.apply_scene(scene)
+            except ValueError as e:
+                return error(str(e))
             return jsonify({'success': True})
 
         @app.route('/api/scenes/<scene_name>', methods=['DELETE'])

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP BLE Bridge - Light Management</title>
-    <link rel="stylesheet" href="static/css/style.css?v=0.60.1">
+    <link rel="stylesheet" href="static/css/style.css?v=0.61.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
@@ -26,9 +26,10 @@
         <header>
             <div class="header-title">
                 <h1>🔆 ESP BLE Bridge</h1>
-                <span class="version">v0.60.1 (Firmware: <span id="firmware-version-display">{{ version }}</span>)</span>
+                <span class="version">v0.61.0 (Firmware: <span id="firmware-version-display">{{ version }}</span>)</span>
             </div>
             <div class="header-controls">
+                <button id="stop-effects-btn" class="btn btn-danger" style="display: none;" onclick="stopAllEffects()" title="Stop every running effect; the lights keep their current color">⏹ Stop effects</button>
                 <button id="dark-mode-toggle" class="btn btn-secondary" title="Toggle Dark Mode">🌙</button>
                 <button id="import-app-btn" class="btn btn-primary">📱 Import from BRMesh App</button>
                 <button id="refresh-btn" class="btn btn-secondary">🔄 Refresh</button>
@@ -70,6 +71,12 @@
 
         <!-- Lights Tab -->
         <div id="lights-tab" class="tab-content active">
+            <div class="all-lights-bar">
+                <span class="preset-row-label">All lights:</span>
+                <button class="btn btn-secondary btn-sm" onclick="setAllLights({state: true})">💡 On</button>
+                <button class="btn btn-secondary btn-sm" onclick="setAllLights({state: false})">⚡ Off</button>
+                <div class="preset-row" id="all-lights-presets"></div>
+            </div>
             <div class="lights-grid" id="lights-grid">
                 <!-- Populated by JavaScript -->
             </div>
@@ -78,21 +85,33 @@
         <!-- Pairing Tab -->
         <div id="pairing-tab" class="tab-content">
             <div class="pairing-panel">
-                <h2>🔗 Adding lights</h2>
+                <h2>🔗 Pair new lamps</h2>
                 <div class="pairing-instructions">
                     <ol>
-                        <li>Pair the lights with the <strong>BRMesh</strong> app on your phone as usual.</li>
-                        <li>In the app, export your configuration (it creates a <code>BRMESH_BACKUP…</code> file).</li>
-                        <li>Click <strong>Import from BRMesh App</strong> and choose that file from your phone or computer.
-                            The mesh key, every light's ID, name and type are read from it.</li>
-                        <li>Install the firmware on your ESP32 controller(s) from the Controllers tab.</li>
+                        <li>Reset the lamps you want to add, the same way as before pairing them with the BRMesh app
+                            (for most lamps: switch the power off and on 5 times, about 1 second each, until it blinks).
+                            Lamps already paired with the app must be reset first.</li>
+                        <li>Pick the ESP32 controller closest to them and press <strong>Start pairing</strong>.
+                            The controller looks for reset lamps for 2 minutes and gives each one a free light ID and your mesh key.</li>
+                        <li>Paired lamps are added to the Lights tab. <strong>Install the firmware</strong> on your controllers
+                            afterwards (Controllers tab) so the new lights show up in Home Assistant.</li>
                     </ol>
-                    <div class="alert alert-info">
-                        Pairing reset lights directly from the ESP32 is not supported: the app's pairing reply comes
-                        from its native library, which has not been reverse engineered. Lights paired in the app work
-                        right away once the export is imported.
+                    <div class="pairing-controls">
+                        <label for="pairing-controller">Controller:</label>
+                        <select id="pairing-controller"></select>
+                        <button id="pairing-start-btn" class="btn btn-primary" onclick="startPairing()">🔗 Start pairing</button>
+                        <button id="pairing-stop-btn" class="btn btn-danger" style="display: none;" onclick="stopPairing()">⏹ Stop</button>
                     </div>
-                    <button class="btn btn-primary" onclick="openImportModal()">📱 Import from BRMesh App</button>
+                    <div id="pairing-status" class="pairing-status"></div>
+                    <table class="import-table" id="pairing-table" style="display: none;"></table>
+                    <div class="alert alert-info">
+                        Pairing needs controller firmware 2.1.0 or newer. Lamps paired here do not appear in the BRMesh app,
+                        and the app does not know which light IDs the add-on gave out. If you also pair lamps with the app,
+                        import its export first so both use the same mesh key and the add-on knows the IDs the app took.
+                        Lamps that answer with the app's newer "extended" protocol are listed but cannot be paired yet.
+                    </div>
+                    <p>Or add lamps that are already paired in the BRMesh app from its export:</p>
+                    <button class="btn btn-secondary" onclick="openImportModal()">📱 Import from BRMesh App</button>
                 </div>
             </div>
         </div>
@@ -111,7 +130,10 @@
                     <!-- Populated by JavaScript -->
                 </div>
                 <div class="running-effects">
-                    <h3>Running Effects</h3>
+                    <h3>Running Effects
+                        <button id="stop-all-effects-btn" class="btn btn-danger btn-sm" style="display: none;" onclick="stopAllEffects()">⏹ Stop all</button>
+                    </h3>
+                    <p><small>Setting a light on the Lights tab, or switching it off anywhere (here or in Home Assistant), takes it out of its effect.</small></p>
                     <div id="running-effects-list">
                         <p class="empty-message">No effects running</p>
                     </div>
@@ -140,30 +162,6 @@
                             <label for="log-controller">Controller:</label>
                             <select id="log-controller" onchange="switchLogController()">
                                 <option value="">Select Controller...</option>
-                            </select>
-                        </div>
-                        <div class="form-group" style="display: inline-block; margin-right: 15px;">
-                            <label for="log-level">Log Level:</label>
-                            <select id="log-level" onchange="filterLogs()">
-                                <option value="all">All Levels</option>
-                                <option value="E">🔴 Error</option>
-                                <option value="W">🟡 Warning</option>
-                                <option value="I">🔵 Info</option>
-                                <option value="D" selected>🟢 Debug</option>
-                                <option value="V">⚪ Verbose</option>
-                            </select>
-                        </div>
-                        <div class="form-group" style="display: inline-block; margin-right: 15px;">
-                            <label for="log-category">Category:</label>
-                            <select id="log-category" onchange="filterLogs()">
-                                <option value="all">All Categories</option>
-                                <option value="pairing">🔗 Pairing</option>
-                                <option value="ble_scan">📡 BLE Scan</option>
-                                <option value="fastcon">💡 Light Control</option>
-                                <option value="group">👥 Groups</option>
-                                <option value="scene">🎬 Scenes</option>
-                                <option value="wifi">📶 WiFi</option>
-                                <option value="api">🔌 API</option>
                             </select>
                         </div>
                         <button class="btn btn-secondary" onclick="clearLogDisplay()">🗑️ Clear</button>
@@ -322,6 +320,7 @@
         <div class="modal-content">
             <span class="close">&times;</span>
             <h2>Pick Color</h2>
+            <div class="preset-row" id="modal-presets"></div>
             <input type="color" id="color-input" value="#ffffff">
             <div class="brightness-control">
                 <label>Brightness:</label>
@@ -363,7 +362,7 @@
         </div>
     </div>
 
-    <script src="static/js/app.js?v=0.60.1"></script>
+    <script src="static/js/app.js?v=0.61.0"></script>
     <script>
     function toggleMapSettings() {
         const mapEnabled = document.getElementById('map-enabled').checked;

@@ -141,6 +141,10 @@ def _device(addr: Any, name: Any, type_code: Any, extra: Optional[Dict] = None) 
     return item
 
 
+# Public name for code outside the importer (lamps paired by a controller).
+classify_device = _device
+
+
 def _split(devices: List[Dict]) -> Dict:
     lights, skipped, seen = [], [], set()
     for d in devices:

@@ -7,6 +7,9 @@ let lightMarkers = {};
 let controllerMarkers = {};
 let selectedLights = new Set();
 let currentLightForColor = null;
+let presets = [];
+let effectsList = [];
+let runningEffects = [];
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', async () => {
@@ -30,6 +33,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         showNotification('⚠️ Import your BRMesh app export (📱 Import from BRMesh App) or enter the mesh key in Settings to get started', 'warning');
     }
     
+    await loadPresets();
+    await loadRunningEffects();
     await loadLights();
     await loadControllers();
     await loadEffects();
@@ -60,7 +65,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     
     // Light states are cheap to refresh; controllers change rarely. Skip while the page is hidden.
-    setInterval(() => { if (!document.hidden) loadLights(); }, 5000);
+    setInterval(async () => {
+        if (document.hidden) return;
+        await loadRunningEffects();
+        loadLights();
+    }, 5000);
     setInterval(() => { if (!document.hidden) loadControllers(); }, 30000);
 });
 
@@ -95,6 +104,8 @@ function setupTabs() {
             if (tab === 'map' && map) {
                 setTimeout(() => map.invalidateSize(), 100);
             }
+            
+            if (tab === 'pairing') pollPairing();
             
             // Load settings when settings tab is activated
             if (tab === 'settings') {
@@ -193,6 +204,7 @@ async function loadLights() {
         }));
         renderLights();
         renderLightSelectors();
+        renderRunningEffects();  // names the lights of running effects
         updateMapMarkers();
     } catch (error) {
         console.error('Failed to load lights:', error);
@@ -209,6 +221,7 @@ async function loadControllers() {
             location: controller.location || { x: null, y: null }
         }));
         renderControllers();
+        renderPairingControllers();
         updateMapMarkers();
         initLogViewer(); // Update log controller dropdown
     } catch (error) {
@@ -216,10 +229,22 @@ async function loadControllers() {
     }
 }
 
+async function loadPresets() {
+    try {
+        const response = await fetch('api/presets');
+        presets = await response.json();
+        renderAllLightsPresets();
+        renderModalPresets();
+    } catch (error) {
+        console.error('Failed to load presets:', error);
+    }
+}
+
 async function loadEffects() {
     try {
         const response = await fetch('api/effects');
         const effects = await response.json();
+        effectsList = effects.map(e => e.name);
         renderEffects(effects);
     } catch (error) {
         console.error('Failed to load effects:', error);
@@ -246,15 +271,16 @@ function renderLights() {
         card.className = `light-card ${light.state.state ? 'active' : ''}`;
         
         const rgb = light.state.rgb || [255, 255, 255];
-        const brightness = light.state.brightness || 255;
         const colorHex = rgbToHex(rgb[0], rgb[1], rgb[2]);
+        const effect = runningEffects.find(e => e.light_ids.includes(light.id));
+        const whites = presets.filter(p => p.kelvin).map(p => presetSwatch(p, `applyPreset(${light.id}, '${p.id}')`)).join('');
         
         card.innerHTML = `
             <div class="light-header">
                 <span class="light-name">${escapeHtml(light.name)}</span>
                 <span class="light-status ${light.state.state ? 'on' : ''}"></span>
             </div>
-            <div class="light-meta">ID ${light.id}${light.kind ? ' · ' + light.kind.toUpperCase() : ''}${light.on_controller === false ? ' · <span class="warn" title="Assign it to a controller (Controllers tab → 💡 Lights)">not on any controller</span>' : (light.state.entity_id ? '' : ' · <span class="warn" title="Install the firmware on a controller and add it to Home Assistant (ESPHome integration)">not in Home Assistant yet</span>')}</div>
+            <div class="light-meta">ID ${light.id}${light.kind ? ' · ' + light.kind.toUpperCase() : ''}${effect ? ` · <span class="effect-badge" title="Setting this light stops the effect for it">✨ ${escapeHtml(effect.effect)}</span>` : ''}${light.on_controller === false ? ' · <span class="warn" title="Assign it to a controller (Controllers tab → 💡 Lights)">not on any controller</span>' : (light.state.entity_id ? '' : ' · <span class="warn" title="Install the firmware on a controller and add it to Home Assistant (ESPHome integration)">not in Home Assistant yet</span>')}</div>
             <div class="light-controls">
                 <button class="btn btn-primary" onclick="toggleLight(${light.id})">
                     ${light.state.state ? '⚡ Off' : '💡 On'}
@@ -265,7 +291,11 @@ function renderLights() {
             </div>
             <div class="color-preview" style="background-color: ${colorHex};" 
                  onclick="pickColor(${light.id})"></div>
+            ${whites ? `<div class="preset-row compact"><span class="preset-row-label">White:</span>${whites}</div>` : ''}
             <div class="light-actions">
+                <button class="btn btn-secondary btn-sm" onclick="identifyLight(${light.id})" title="Blink this light three times so you can find it">
+                    🔦 Identify
+                </button>
                 <button class="btn btn-danger btn-sm" onclick="unpairLight(${light.id}, ${JSON.stringify(light.name).replace(/"/g, '&quot;')})" title="Remove from system">
                     🗑️ Remove
                 </button>
@@ -308,17 +338,14 @@ async function toggleLight(lightId) {
         const response = await fetch(`api/lights/${lightId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                state: !light.state.state,
-                brightness: light.state.brightness || 255,
-                rgb: light.state.rgb || [255, 255, 255]
-            })
+            // Only switch: Home Assistant turns the lamp back on with its last color or white.
+            body: JSON.stringify({ state: !light.state.state })
         });
         if (!response.ok) {
             const result = await response.json();
             showNotification(result.error || 'Could not switch the light', 'error');
         }
-        setTimeout(loadLights, 700);
+        setTimeout(refreshLightsAndEffects, 700);
     } catch (error) {
         console.error('Failed to toggle light:', error);
     }
@@ -349,7 +376,7 @@ async function applyColor() {
     const rgb = hexToRgb(colorHex);
     
     try {
-        await fetch(`api/lights/${currentLightForColor}`, {
+        const response = await fetch(`api/lights/${currentLightForColor}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -358,12 +385,90 @@ async function applyColor() {
                 rgb: [rgb.r, rgb.g, rgb.b]
             })
         });
+        if (!response.ok) {
+            const result = await response.json();
+            showNotification(result.error || 'Could not set the color', 'error');
+        }
         
         document.getElementById('color-picker-modal').style.display = 'none';
-        await loadLights();
+        await refreshLightsAndEffects();
     } catch (error) {
         console.error('Failed to apply color:', error);
     }
+}
+
+// Presets (white and color shortcuts)
+function presetSwatch(preset, onclick) {
+    return `<button class="preset-swatch" title="${escapeHtml(preset.label)}${preset.kelvin ? ` (${preset.kelvin} K)` : ''}"
+                style="background: rgb(${preset.swatch.join(',')});" onclick="${onclick}"></button>`;
+}
+
+function presetChip(preset, onclick) {
+    return `<button class="preset-chip" onclick="${onclick}" title="${preset.kelvin ? preset.kelvin + ' K' : ''}">
+                <span class="preset-dot" style="background: rgb(${preset.swatch.join(',')});"></span>${escapeHtml(preset.label)}
+            </button>`;
+}
+
+function renderAllLightsPresets() {
+    const row = document.getElementById('all-lights-presets');
+    if (row) row.innerHTML = presets.map(p => presetChip(p, `setAllLights({preset: '${p.id}'})`)).join('');
+}
+
+function renderModalPresets() {
+    const row = document.getElementById('modal-presets');
+    if (row) row.innerHTML = presets.map(p => presetChip(p, `applyPresetFromModal('${p.id}')`)).join('');
+}
+
+async function sendLightRequest(url, body, failMessage) {
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+            const result = await response.json();
+            showNotification(result.error || failMessage, 'error');
+            return false;
+        }
+        setTimeout(refreshLightsAndEffects, 700);
+        return true;
+    } catch (error) {
+        console.error(failMessage, error);
+        showNotification(failMessage, 'error');
+        return false;
+    }
+}
+
+async function applyPreset(lightId, presetId) {
+    const light = lights.find(l => l.id === lightId);
+    const body = { preset: presetId };
+    // Keep the brightness of a lamp that is already on.
+    if (light && light.state.state && light.state.brightness) body.brightness = light.state.brightness;
+    await sendLightRequest(`api/lights/${lightId}`, body, 'Could not set the light');
+}
+
+async function applyPresetFromModal(presetId) {
+    if (currentLightForColor === null) return;
+    const brightness = parseInt(document.getElementById('brightness-input').value);
+    if (await sendLightRequest(`api/lights/${currentLightForColor}`, { preset: presetId, brightness }, 'Could not set the light')) {
+        document.getElementById('color-picker-modal').style.display = 'none';
+    }
+}
+
+async function setAllLights(body) {
+    await sendLightRequest('api/lights/bulk', body, 'Could not set the lights');
+}
+
+async function identifyLight(lightId) {
+    if (await sendLightRequest(`api/lights/${lightId}/identify`, {}, 'Could not blink the light')) {
+        showNotification('Watch for the light blinking three times', 'info');
+    }
+}
+
+async function refreshLightsAndEffects() {
+    await loadRunningEffects();
+    await loadLights();
 }
 
 // Effects Management
@@ -413,7 +518,7 @@ async function startEffect(effectName) {
     }
     
     try {
-        await fetch(`api/effects/${effectName}`, {
+        const response = await fetch(`api/effects/${effectName}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -421,23 +526,79 @@ async function startEffect(effectName) {
                 params: params
             })
         });
-        
-        alert(`Effect ${effectName} started!`);
+        const result = await response.json();
+        if (!response.ok) {
+            showNotification(result.error || 'Could not start the effect', 'error');
+            return;
+        }
+        showNotification(`Effect ${effectName} started. Stop it under Running Effects or with ⏹ Stop effects.`, 'success');
+        await refreshLightsAndEffects();
     } catch (error) {
         console.error('Failed to start effect:', error);
     }
 }
 
-async function stopAllEffects() {
+async function loadRunningEffects() {
+    try {
+        const response = await fetch('api/effects/running');
+        runningEffects = await response.json();
+    } catch (error) {
+        console.error('Failed to load running effects:', error);
+        return;
+    }
+    renderRunningEffects();
+}
+
+function renderRunningEffects() {
+    const list = document.getElementById('running-effects-list');
+    const stopBtn = document.getElementById('stop-effects-btn');
+    if (stopBtn) {
+        stopBtn.style.display = runningEffects.length ? '' : 'none';
+        stopBtn.textContent = `⏹ Stop effects (${runningEffects.length})`;
+    }
+    const stopAllBtn = document.getElementById('stop-all-effects-btn');
+    if (stopAllBtn) stopAllBtn.style.display = runningEffects.length ? '' : 'none';
+    if (!list) return;
+    if (!runningEffects.length) {
+        list.innerHTML = '<p class="empty-message">No effects running</p>';
+        return;
+    }
+    list.innerHTML = runningEffects.map(run => {
+        const names = run.light_ids.map(id => (lights.find(l => l.id === id) || { name: `Light ${id}` }).name);
+        const shown = names.length > 4 ? `${names.slice(0, 4).join(', ')} +${names.length - 4} more` : names.join(', ');
+        return `<div class="running-effect-item">
+                    <span><strong>${escapeHtml(run.effect)}</strong> · ${escapeHtml(shown)}</span>
+                    <button class="btn btn-danger btn-sm" onclick="stopEffect('${run.id}')">⏹ Stop</button>
+                </div>`;
+    }).join('');
+}
+
+async function stopEffect(effectId) {
     try {
         await fetch('api/effects/stop', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ effect_id: effectId })
+        });
+    } catch (error) {
+        console.error('Failed to stop effect:', error);
+    }
+    await refreshLightsAndEffects();
+}
+
+async function stopAllEffects() {
+    try {
+        const response = await fetch('api/effects/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({})
         });
+        const result = await response.json();
+        showNotification(`Stopped ${result.stopped || 0} effect(s). The lights keep their current color.`, 'success');
     } catch (error) {
         console.error('Failed to stop effects:', error);
     }
+    await refreshLightsAndEffects();
 }
 
 // Scenes Management
@@ -451,35 +612,55 @@ function renderScenes(scenes) {
         
         let preview = '';
         if (scene.effect) {
-            preview = `<div class="scene-preview">Effect: ${scene.effect}</div>`;
+            preview = `<div class="scene-preview">Effect: ${escapeHtml(scene.effect)}</div>`;
         } else if (scene.lights) {
             const colors = scene.lights.slice(0, 5).map(l => {
-                const rgb = l.rgb || [255, 255, 255];
+                // Older scenes stored colors as {r, g, b}.
+                const rgb = Array.isArray(l.rgb) ? l.rgb : (l.rgb ? [l.rgb.r, l.rgb.g, l.rgb.b] : [255, 255, 255]);
                 return `<div class="scene-color" style="background: rgb(${rgb.join(',')})"></div>`;
             }).join('');
             preview = `<div class="scene-preview">${colors}</div>`;
         }
         
         card.innerHTML = `
-            <div class="scene-name">${scene.name}</div>
+            <div class="scene-name">${escapeHtml(scene.name)}</div>
             ${preview}
+            <button class="btn btn-danger btn-sm scene-delete" title="Delete scene">🗑️</button>
         `;
         
         card.addEventListener('click', () => applyScene(scene.name));
+        card.querySelector('.scene-delete').addEventListener('click', (event) => {
+            event.stopPropagation();
+            deleteScene(scene.name);
+        });
         grid.appendChild(card);
     });
 }
 
 async function applyScene(sceneName) {
     try {
-        await fetch(`api/scenes/${sceneName}`, {
+        const response = await fetch(`api/scenes/${encodeURIComponent(sceneName)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
         });
+        if (!response.ok) {
+            const result = await response.json();
+            showNotification(result.error || 'Could not apply the scene', 'error');
+        }
         
-        await loadLights();
+        await refreshLightsAndEffects();
     } catch (error) {
         console.error('Failed to apply scene:', error);
+    }
+}
+
+async function deleteScene(sceneName) {
+    if (!confirm(`Delete scene "${sceneName}"?`)) return;
+    try {
+        await fetch(`api/scenes/${encodeURIComponent(sceneName)}`, { method: 'DELETE' });
+        await loadScenes();
+    } catch (error) {
+        console.error('Failed to delete scene:', error);
     }
 }
 
@@ -510,12 +691,9 @@ function createScene() {
             <div id="scene-effect-config" class="form-group" style="display: none;">
                 <label for="scene-effect">Effect:</label>
                 <select id="scene-effect">
-                    <option value="rainbow">Rainbow</option>
-                    <option value="chase">Chase</option>
-                    <option value="twinkle">Twinkle</option>
-                    <option value="pulse">Pulse</option>
-                    <option value="fade">Fade</option>
+                    ${effectsList.map(name => `<option value="${name}">${name.replace('_', ' ')}</option>`).join('')}
                 </select>
+                <small>Runs on every light until you stop it or set the lights yourself.</small>
             </div>
             <div class="modal-buttons">
                 <button class="btn btn-primary" onclick="saveScene()">💾 Save Scene</button>
@@ -567,7 +745,7 @@ async function saveScene() {
             const lightId = parseInt(checkbox.dataset.lightId);
             const colorInput = document.querySelector(`.scene-light-color[data-light-id="${lightId}"]`);
             const color = hexToRgb(colorInput.value);
-            sceneData.lights.push({ id: lightId, rgb: color, brightness: 255 });
+            sceneData.lights.push({ id: lightId, rgb: [color.r, color.g, color.b], brightness: 255 });
         });
     } else {
         sceneData.effect = document.getElementById('scene-effect').value;
@@ -1463,37 +1641,122 @@ function hexToRgb(hex) {
     } : { r: 255, g: 255, b: 255 };
 }
 
-async function scanForLights() {
-    const scanBtn = document.getElementById('scan-btn');
-    const originalText = scanBtn.textContent;
-    
+// Pairing reset lamps through a controller
+let pairingPoll = null;
+let pairingSeen = new Set();
+
+function renderPairingControllers() {
+    const select = document.getElementById('pairing-controller');
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = controllers.length
+        ? controllers.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}${c.online ? '' : ' (offline)'}</option>`).join('')
+        : '<option value="">No controllers yet</option>';
+    if (current && controllers.some(c => c.name === current)) select.value = current;
+}
+
+async function startPairing() {
+    const controller = document.getElementById('pairing-controller').value;
+    if (!controller) {
+        showNotification('Add an ESP32 controller first (Controllers tab)', 'error');
+        return;
+    }
     try {
-        // Show progress
-        scanBtn.disabled = true;
-        scanBtn.textContent = '🔍 Scanning... (30s)';
-        showNotification('Scanning for BRMesh lights... This will take 30 seconds.', 'info');
-        
-        const response = await fetch('api/scan', { method: 'POST' });
+        const response = await fetch('api/pairing/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ controller, seconds: 120 })
+        });
         const result = await response.json();
-        
-        if (result.error) {
-            showNotification(`Scan failed: ${result.error}`, 'error');
-        } else {
-            showNotification(`Found ${result.count || 0} new lights!`, result.count > 0 ? 'success' : 'info');
-            if (result.count > 0) {
-                await loadLights();
-            }
+        if (!response.ok) {
+            showNotification(result.error || 'Could not start pairing', 'error');
+            return;
         }
+        pairingSeen = new Set();
+        showNotification(`Pairing on ${result.controller} for ${result.seconds} s`, 'success');
+        schedulePairingPoll(1000);
     } catch (error) {
-        console.error('Failed to scan for lights:', error);
-        showNotification('Scan failed. Check add-on logs for details.', 'error');
-    } finally {
-        scanBtn.disabled = false;
-        scanBtn.textContent = originalText;
+        console.error('Failed to start pairing:', error);
+    }
+}
+
+async function stopPairing() {
+    const controller = document.getElementById('pairing-controller').value;
+    await fetch('api/pairing/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ controller })
+    });
+    schedulePairingPoll(1500);
+}
+
+function schedulePairingPoll(delay) {
+    if (pairingPoll) clearTimeout(pairingPoll);
+    pairingPoll = setTimeout(pollPairing, delay);
+}
+
+async function pollPairing() {
+    pairingPoll = null;
+    const controller = document.getElementById('pairing-controller').value;
+    if (!controller) return;
+    let result;
+    try {
+        const response = await fetch(`api/pairing/status?controller=${encodeURIComponent(controller)}`);
+        result = await response.json();
+        if (!response.ok) return;
+    } catch (error) {
+        console.error('Failed to read pairing status:', error);
+        return;
+    }
+    renderPairing(result);
+    if (result.added && result.added.length) {
+        showNotification(`Added light ${result.added.join(', ')}. Install the firmware on your controllers to control them.`, 'success');
+        loadLights();
+    }
+    if (result.active) schedulePairingPoll(2000);
+}
+
+function renderPairing(result) {
+    const status = document.getElementById('pairing-status');
+    const table = document.getElementById('pairing-table');
+    document.getElementById('pairing-start-btn').style.display = result.active ? 'none' : '';
+    document.getElementById('pairing-stop-btn').style.display = result.active ? '' : 'none';
+    if (!result.available) {
+        status.textContent = 'This controller has no pairing sensor in Home Assistant yet. Install firmware 2.1.0 or newer on it.';
+        table.style.display = 'none';
+        return;
+    }
+    const paired = result.lamps.filter(l => l.state === 'ok').length;
+    status.textContent = result.active
+        ? `Looking for reset lamps… ${result.lamps.length} found, ${paired} paired.`
+        : (result.lamps.length ? `Pairing finished: ${paired} of ${result.lamps.length} lamp(s) paired.` : 'Not pairing.');
+    if (!result.lamps.length) {
+        table.style.display = 'none';
+        return;
+    }
+    const labels = { ok: '✅ Paired', wait: result.active ? '⏳ Pairing…' : '❔ Not confirmed', nofree: '⚠️ No free light ID', unsup: '⚠️ Extended protocol, not supported yet' };
+    table.innerHTML = '<tr><th>Light ID</th><th>Device</th><th>Type</th><th>State</th><th></th></tr>' + result.lamps.map(l => `
+        <tr>
+            <td>${l.light_id || '–'}</td>
+            <td><code>${escapeHtml(l.did)}</code></td>
+            <td>${escapeHtml(l.type_label || String(l.type_code))}</td>
+            <td>${labels[l.state] || escapeHtml(l.state)}</td>
+            <td>${l.state === 'wait' && !result.active && !l.known && l.light_id
+                ? `<button class="btn btn-secondary btn-sm" onclick="addUnconfirmedLamp(${l.light_id}, '${escapeHtml(l.did)}', ${l.type_code})" title="The lamp may have joined without the controller hearing its confirmation">Add anyway</button>`
+                : (l.known ? 'in Lights' : '')}</td>
+        </tr>`).join('');
+    table.style.display = '';
+}
+
+async function addUnconfirmedLamp(lightId, did, typeCode) {
+    if (await sendLightRequest('api/pairing/add', { light_id: lightId, did, type_code: typeCode }, 'Could not add the lamp')) {
+        showNotification(`Added light ${lightId}. Test it after installing the firmware; if it does not react, reset and pair it again.`, 'success');
+        schedulePairingPoll(500);
     }
 }
 
 async function refreshAll() {
+    await loadRunningEffects();
     await loadLights();
     await loadControllers();
 }
@@ -2642,322 +2905,3 @@ function escapeHtml(text) {
     div.textContent = text;
     return div.innerHTML;
 }
-
-// ============================================
-// Pairing Functions
-// ============================================
-
-let discoveredDevices = [];
-
-async function scanForPairingDevices() {
-    const btn = document.getElementById('scan-pairing-btn');
-    const status = document.getElementById('pairing-status');
-    const devicesList = document.getElementById('devices-list');
-    const discoveredDiv = document.getElementById('discovered-devices');
-    
-    btn.disabled = true;
-    btn.textContent = '📡 Scanning...';
-    status.style.display = 'block';
-    status.className = 'status-message info';
-    status.textContent = 'Initializing BLE scan...';
-    
-    // Use EventSource for Server-Sent Events (SSE) progress updates
-    const eventSource = new EventSource('api/pairing/discover', {
-        headers: { 'Accept': 'text/event-stream' }
-    });
-    
-    let scanCompleted = false;
-    
-    eventSource.addEventListener('status', (event) => {
-        const data = JSON.parse(event.data);
-        status.className = 'status-message info';
-        status.textContent = `📡 ${data.message}`;
-        console.log(`Progress: ${data.progress}%`, data.message);
-    });
-    
-    eventSource.addEventListener('complete', (event) => {
-        const data = JSON.parse(event.data);
-        scanCompleted = true;
-        eventSource.close();
-        
-        discoveredDevices = data.devices;
-        
-        if (data.devices.length === 0) {
-            status.className = 'status-message warning';
-            status.textContent = '⚠️ No devices found.';
-            discoveredDiv.style.display = 'none';
-        } else {
-            const pairableCount = data.devices.filter(d => d.pairing_mode && !d.ignored).length;
-            status.className = 'status-message success';
-            status.textContent = `✅ Found ${data.count} devices (${pairableCount} pairable)`;
-            discoveredDiv.style.display = 'block';
-            
-            // Render devices list
-            let html = '';
-            
-            // Filter out ignored devices unless we want to show them (maybe add a toggle later)
-            const visibleDevices = data.devices.filter(d => !d.ignored);
-            
-            if (visibleDevices.length === 0) {
-                html = '<p>No visible devices found (check ignored list).</p>';
-            } else {
-                // Group by pairable status
-                const pairable = visibleDevices.filter(d => d.pairing_mode);
-                const others = visibleDevices.filter(d => !d.pairing_mode);
-                
-                if (pairable.length > 0) {
-                    html += '<h4>✨ Ready to Pair</h4>';
-                    pairable.forEach((device, index) => {
-                        html += renderDeviceCard(device, index, true);
-                    });
-                }
-                
-                if (others.length > 0) {
-                    html += '<h4 style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 10px;">Other Devices</h4>';
-                    others.forEach((device, index) => {
-                        html += renderDeviceCard(device, index + pairable.length, false);
-                    });
-                }
-            }
-            
-            devicesList.innerHTML = html;
-            
-            // Check if auto-pair is enabled (only for pairable devices)
-            const autoPairMode = document.getElementById('auto-pair-mode').checked;
-            const pairableDevices = visibleDevices.filter(d => d.pairing_mode);
-            if (autoPairMode && pairableDevices.length > 0) {
-                status.className = 'status-message info';
-                status.textContent = '🤖 Auto-pair enabled: Pairing devices automatically...';
-                autoPairDevices(pairableDevices);
-            }
-        }
-        
-        btn.disabled = false;
-        btn.textContent = '📡 Scan for Devices';
-    });
-    
-    eventSource.addEventListener('error', (event) => {
-        scanCompleted = true;
-        eventSource.close();
-        
-        let errorMsg = 'Unknown error';
-        try {
-            if (event.data) {
-                const data = JSON.parse(event.data);
-                errorMsg = data.message || errorMsg;
-            }
-        } catch (e) {
-            errorMsg = 'Connection error';
-        }
-        
-        status.className = 'status-message error';
-        status.textContent = '❌ Error: ' + errorMsg;
-        discoveredDiv.style.display = 'none';
-        
-        btn.disabled = false;
-        btn.textContent = '📡 Scan for Devices';
-    });
-    
-    // Fallback timeout (20 seconds)
-    setTimeout(() => {
-        if (!scanCompleted) {
-            eventSource.close();
-            status.className = 'status-message error';
-            status.textContent = '❌ Scan timed out';
-            btn.disabled = false;
-            btn.textContent = '📡 Scan for Devices';
-        }
-    }, 20000);
-}
-
-function renderDeviceCard(device, index, isPairable) {
-    const deviceId = `device-${device.mac.replace(/:/g, '')}`;
-    const manufacturer = device.manufacturer !== 'Unknown' ? device.manufacturer : 
-                        (device.manufacturer_id ? `ID: 0x${device.manufacturer_id.toString(16)}` : 'Unknown');
-    
-    return `
-        <div class="device-card ${isPairable ? 'pairable' : ''}" id="${deviceId}" data-mac="${device.mac}">
-            <div class="device-info">
-                <strong>${device.name || (isPairable ? 'BRMesh Light' : 'Unknown Device')}</strong>
-                <div class="device-details">
-                    <span>📍 ${device.mac}</span>
-                    <span>📶 ${device.rssi} dBm</span>
-                    <span>🏷️ ${manufacturer}</span>
-                </div>
-            </div>
-            <div class="device-actions">
-                <button class="btn btn-secondary btn-sm" onclick="showDeviceInfo('${device.mac}')" title="Show Details">
-                    ℹ️ Info
-                </button>
-                <button class="btn btn-secondary btn-sm" onclick="ignoreDevice('${device.mac}', '${deviceId}')" title="Ignore this device">
-                    ⛔ Ignore
-                </button>
-                ${isPairable ? `
-                <button class="btn btn-success btn-sm" onclick="pairDevice('${device.mac}', ${index})">
-                    🔗 Pair
-                </button>` : ''}
-            </div>
-        </div>
-    `;
-}
-
-async function ignoreDevice(mac, deviceId) {
-    if (!confirm(`Ignore device ${mac}? It will be hidden from future scans.`)) return;
-
-    try {
-        const response = await fetch('api/pairing/ignore', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mac })
-        });
-        
-        if (response.ok) {
-            const deviceCard = document.getElementById(deviceId);
-            if (deviceCard) {
-                deviceCard.style.opacity = '0.3';
-                deviceCard.style.pointerEvents = 'none';
-                
-                // Add ignored badge
-                const deviceInfo = deviceCard.querySelector('.device-info');
-                const badge = document.createElement('span');
-                badge.className = 'device-badge ignored';
-                badge.textContent = '🚫 Ignored';
-                badge.style.color = '#999';
-                badge.style.marginLeft = '10px';
-                deviceInfo.querySelector('strong').appendChild(badge);
-                
-                showNotification(`Device ${mac} ignored`, 'info');
-            }
-        } else {
-            showNotification('Failed to ignore device', 'error');
-        }
-    } catch (error) {
-        console.error('Ignore error:', error);
-        showNotification('Failed to ignore device: ' + error.message, 'error');
-    }
-}
-
-function showDeviceInfo(mac) {
-    const device = discoveredDevices.find(d => d.mac === mac);
-    if (!device) return;
-    
-    const info = `
-        Device Details:
-        ---------------
-        MAC: ${device.mac}
-        Name: ${device.name || 'N/A'}
-        RSSI: ${device.rssi} dBm
-        Manufacturer: ${device.manufacturer}
-        Manufacturer ID: ${device.manufacturer_id ? '0x' + device.manufacturer_id.toString(16) : 'N/A'}
-        Pairing Mode: ${device.pairing_mode ? 'Yes' : 'No'}
-        Raw Data: ${device.raw_data || 'N/A'}
-    `;
-    
-    alert(info);
-}
-
-async function autoPairDevices(devices) {
-    const status = document.getElementById('pairing-status');
-    
-    for (let i = 0; i < devices.length; i++) {
-        const device = devices[i];
-        status.className = 'status-message info';
-        status.textContent = `🤖 Auto-pairing device ${i + 1}/${devices.length}: ${device.mac}...`;
-        
-        try {
-            await pairDevice(device.mac, i);
-            // Wait 2 seconds between pairings
-            await new Promise(resolve => setTimeout(resolve, 2000));
-        } catch (error) {
-            console.error(`Auto-pair failed for ${device.mac}:`, error);
-            status.className = 'status-message error';
-            status.textContent = `❌ Auto-pair failed for ${device.mac}: ${error.message}`;
-            // Continue to next device
-        }
-    }
-    
-    status.className = 'status-message success';
-    status.textContent = `✅ Auto-pairing complete! Paired ${devices.length} device(s)`;
-}
-
-async function sendTestCommand(commandType) {
-    const testStatus = document.getElementById('test-status');
-    const address = parseInt(document.getElementById('pairing-address').value) - 1; // Test on last paired device
-    
-    if (address < 1) {
-        testStatus.style.display = 'block';
-        testStatus.className = 'status-message warning';
-        testStatus.textContent = '⚠️ No devices paired yet. Pair a device first.';
-        return;
-    }
-    
-    testStatus.style.display = 'block';
-    testStatus.className = 'status-message info';
-    testStatus.textContent = `⏳ Sending ${commandType} command to address ${address}...`;
-    
-    // Generate payload based on command type
-    let payload = '';
-    switch (commandType) {
-        case 'on':
-            payload = '0164ffffff'; // Turn on, brightness 100, white
-            break;
-        case 'off':
-            payload = '0000000000'; // Turn off
-            break;
-        case 'brightness':
-            payload = '0132ffffff'; // Turn on, brightness 50, white
-            break;
-    }
-    
-    try {
-        const response = await fetch('api/control/send', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                address: address,
-                command_type: 1, // Control command
-                payload: payload,
-                seq: Math.floor(Math.random() * 256)
-            })
-        });
-        
-        const result = await response.json();
-        
-        if (result.success) {
-            testStatus.className = 'status-message success';
-            testStatus.textContent = `✅ Command sent! Command: ${result.command} (${result.length} bytes)`;
-        } else {
-            testStatus.className = 'status-message error';
-            testStatus.textContent = `❌ Command failed: ${result.error}`;
-        }
-        
-    } catch (error) {
-        testStatus.className = 'status-message error';
-        testStatus.textContent = '❌ Error sending command: ' + error.message;
-    }
-}
-
-// Setup pairing event listeners
-document.addEventListener('DOMContentLoaded', () => {
-    const scanBtn = document.getElementById('scan-pairing-btn');
-    if (scanBtn) {
-        scanBtn.addEventListener('click', scanForPairingDevices);
-    }
-    
-    const testOnBtn = document.getElementById('test-on-btn');
-    if (testOnBtn) {
-        testOnBtn.addEventListener('click', () => sendTestCommand('on'));
-    }
-    
-    const testOffBtn = document.getElementById('test-off-btn');
-    if (testOffBtn) {
-        testOffBtn.addEventListener('click', () => sendTestCommand('off'));
-    }
-    
-    const testBrightnessBtn = document.getElementById('test-brightness-btn');
-    if (testBrightnessBtn) {
-        testBrightnessBtn.addEventListener('click', () => sendTestCommand('brightness'));
-    }
-});

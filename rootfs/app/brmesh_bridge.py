@@ -10,12 +10,13 @@ those entities through the Home Assistant API.
 import logging
 import os
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
-from brmesh_export import mask_key
-from effects import BRMeshEffects
+from brmesh_export import classify_device, mask_key
+from effects import BRMeshEffects, kelvin_to_rgb
 from esphome_builder import ESPHomeBuilder
-from esphome_generator import ESPHomeConfigGenerator
+from esphome_generator import PAIRING_SENSOR_NAME, ESPHomeConfigGenerator, controller_slug
 from ha_api import HomeAssistantAPI
 from state_store import StateStore
 
@@ -26,8 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ADDON_VERSION = '0.60.1'
-
+ADDON_VERSION = '0.61.0'
 
 class BRMeshBridge:
     def __init__(self):
@@ -40,6 +40,8 @@ class BRMeshBridge:
         self.nspanel_ui = None
         # Last state requested through the web UI, used when HA has no entity yet.
         self._requested: Dict[int, dict] = {}
+        # When the add-on last switched each entity off, so effects can tell its own offs from the user's.
+        self._own_off: Dict[str, float] = {}
 
     # --- state -------------------------------------------------------------
 
@@ -169,24 +171,49 @@ class BRMeshBridge:
         state = self.ha.state_of(entity) if entity else None
         if state is None:
             req = self._requested.get(light_id, {})
+            kelvin = req.get('kelvin')
             return {'state': req.get('state', False), 'brightness': req.get('brightness', 255),
-                    'rgb': req.get('rgb', [255, 255, 255]), 'entity_id': entity, 'available': False}
+                    'rgb': req.get('rgb') or list(kelvin_to_rgb(kelvin) if kelvin else (255, 255, 255)),
+                    'color_mode': 'color_temp' if kelvin else 'rgb', 'color_temp_kelvin': kelvin,
+                    'entity_id': entity, 'available': False}
         attrs = state.get('attributes', {})
         return {
             'state': state.get('state') == 'on',
             'brightness': attrs.get('brightness') or 0,
             'rgb': list(attrs.get('rgb_color') or [255, 255, 255]),
+            'color_mode': attrs.get('color_mode'),
+            'color_temp_kelvin': attrs.get('color_temp_kelvin'),
             'entity_id': entity,
             'available': state.get('state') not in ('unavailable', 'unknown'),
         }
 
+    def own_off_time(self, entity: str) -> Optional[float]:
+        return self._own_off.get(entity)
+
+    def _white_data(self, entity: str, kelvin: int, brightness: Optional[int]) -> Dict:
+        """turn_on data for a white of `kelvin`, using the white LEDs the entity has."""
+        state = self.ha.state_of(entity) or {}
+        attrs = state.get('attributes', {})
+        modes = attrs.get('supported_color_modes') or []
+        if 'color_temp' in modes:
+            lo = attrs.get('min_color_temp_kelvin') or 2000
+            hi = attrs.get('max_color_temp_kelvin') or 6500
+            return {'color_temp_kelvin': int(max(lo, min(hi, kelvin)))}
+        if 'white' in modes:
+            # `white` selects the white channel and sets its brightness in one go.
+            return {'white': max(1, min(255, int(brightness if brightness is not None else 255)))}
+        return {'rgb_color': list(kelvin_to_rgb(kelvin))}
+
     def set_lights(self, light_ids: List[int], rgb: Optional[Tuple[int, int, int]] = None,
-                   brightness: Optional[int] = None, state: bool = True) -> bool:
-        """Set one or more lights through Home Assistant. Same values -> one service call."""
+                   brightness: Optional[int] = None, state: bool = True, kelvin: Optional[int] = None) -> bool:
+        """Set one or more lights through Home Assistant. Same values -> one service call.
+
+        `kelvin` asks for white of that color temperature instead of `rgb`.
+        """
         entities = []
         for light_id in light_ids:
             self._requested[light_id] = {'state': state, 'brightness': brightness or 255,
-                                         'rgb': list(rgb) if rgb else [255, 255, 255]}
+                                         'rgb': list(rgb) if rgb and not kelvin else None, 'kelvin': kelvin}
             entity = self.light_entity(light_id)
             if entity:
                 entities.append(entity)
@@ -198,21 +225,131 @@ class BRMeshBridge:
         # The broadcast carries the RGBCW device type; the app uses it for group power on every lamp type,
         # but colors were only verified on RGBCW lamps, so mixed setups get colors per light.
         same_kind = len({l.get('kind') for l in self.lights.values()}) == 1
-        if len(entities) == len(self.lights) > 1 and (rgb is None or not state or same_kind):
+        colored = rgb is not None or kelvin is not None
+        if len(entities) == len(self.lights) > 1 and (not colored or not state or same_kind):
             all_entity = self.all_lights_entity()
             if all_entity:
                 entities = [all_entity]
         if not state:
+            now = time.time()
+            for entity in entities:
+                self._own_off[entity] = now
             return self.ha.call_service('light', 'turn_off', {'entity_id': entities})
-        data = {'entity_id': entities}
-        if rgb is not None:
-            data['rgb_color'] = [int(c) for c in rgb]
-        if brightness is not None:
-            data['brightness'] = max(1, min(255, int(brightness)))
-        return self.ha.call_service('light', 'turn_on', data)
+
+        # Lamps of different types take white differently, so they may need separate calls.
+        calls: Dict[str, Tuple[Dict, List[str]]] = {}
+        for entity in entities:
+            if kelvin is not None:
+                data = self._white_data(entity, kelvin, brightness)
+            elif rgb is not None:
+                data = {'rgb_color': [int(c) for c in rgb]}
+            else:
+                data = {}
+            if brightness is not None and 'white' not in data:
+                data['brightness'] = max(1, min(255, int(brightness)))
+            calls.setdefault(repr(sorted(data.items())), (data, []))[1].append(entity)
+        ok = True
+        for data, group in calls.values():
+            ok = self.ha.call_service('light', 'turn_on', {'entity_id': group, **data}) and ok
+        return ok
 
     def set_light_color(self, light_id: int, rgb: tuple, brightness: int = 255, state: bool = True) -> bool:
         return self.set_lights([light_id], rgb, brightness, state)
+
+    def identify(self, light_id: int, flashes: int = 3) -> bool:
+        """Blink a light so it can be found, then put it back the way it was."""
+        if not self.light_entity(light_id):
+            return False
+        before = self.light_state(light_id)
+
+        def blink():
+            for _ in range(flashes):
+                self.set_lights([light_id], None, 255, False)
+                time.sleep(0.8)
+                self.set_lights([light_id], None, 255, True)
+                time.sleep(0.8)
+            if not before['state']:
+                self.set_lights([light_id], None, None, False)
+            elif before.get('color_mode') == 'color_temp' and before.get('color_temp_kelvin'):
+                self.set_lights([light_id], None, before['brightness'] or 255, True, kelvin=before['color_temp_kelvin'])
+            elif before.get('color_mode') == 'white':
+                self.set_lights([light_id], None, before['brightness'] or 255, True, kelvin=4000)
+            else:
+                self.set_lights([light_id], tuple(before['rgb']), before['brightness'] or 255, True)
+
+        threading.Thread(target=blink, name=f'identify-{light_id}', daemon=True).start()
+        return True
+
+    # --- pairing (through a controller's start_pairing action) -----------------
+
+    def _pairing_service(self, controller: Dict, action: str) -> str:
+        # ESPHome API actions are registered as esphome.<node name with _>_<action>.
+        return f"{controller_slug(controller['name']).replace('-', '_')}_{action}"
+
+    def free_light_ids(self, limit: int = 64) -> List[int]:
+        """Light IDs no known lamp uses, lowest first."""
+        return [i for i in range(1, 256) if i not in self.lights][:limit]
+
+    def start_pairing(self, controller: Dict, seconds: int = 120) -> bool:
+        ids = self.free_light_ids()
+        if not ids:
+            raise ValueError('All 255 light IDs are in use')
+        return self.ha.call_service('esphome', self._pairing_service(controller, 'start_pairing'),
+                                    {'light_ids': ids, 'seconds': int(seconds)})
+
+    def stop_pairing(self, controller: Dict) -> bool:
+        return self.ha.call_service('esphome', self._pairing_service(controller, 'stop_pairing'), {})
+
+    def pairing_status(self, controller: Dict) -> Dict:
+        """What the controller's pairing sensor reports; lamps it confirmed are added to the light list.
+
+        The sensor reads "on|<light id>,<device id>,<type>,<state>;..." (state ok, wait, nofree or unsup).
+        """
+        prefix = f"sensor.{controller_slug(controller['name']).replace('-', '_')}_"
+        entity = next((s for s in self.ha.states(max_age=1.0)
+                       if s.get('entity_id', '').startswith(prefix) and
+                       str(s.get('attributes', {}).get('friendly_name', '')).endswith(PAIRING_SENSOR_NAME)), None)
+        if entity is None:
+            return {'available': False, 'active': False, 'lamps': [], 'added': []}
+        active, _, entries = str(entity.get('state', '')).partition('|')
+        lamps, added = [], []
+        for entry in filter(None, entries.split(';')):
+            parts = entry.split(',')
+            if len(parts) != 4:
+                continue
+            try:
+                light_id, did, type_code, state = int(parts[0]), parts[1], int(parts[2]), parts[3]
+            except ValueError:
+                continue
+            lamp = {'light_id': light_id or None, 'did': did, 'type_code': type_code, 'state': state,
+                    'known': light_id in self.lights}
+            if state == 'ok' and light_id and light_id not in self.lights and self.add_paired_light(light_id, did, type_code):
+                added.append(light_id)
+                lamp['known'] = True
+            info = classify_device(1, None, type_code)  # type only
+            lamp['type_label'] = info.get('type_label') or info.get('skip_reason')
+            lamps.append(lamp)
+        if added:
+            self.lights_changed()
+        return {'available': True, 'active': active == 'on', 'lamps': lamps, 'added': added}
+
+    def add_paired_light(self, light_id: int, did: str, type_code: int) -> bool:
+        """Add a lamp a controller paired. Saving and regenerating is left to the caller."""
+        item = classify_device(light_id, None, type_code, {'did': did})
+        if item.get('skip_reason') or light_id in self.lights:
+            return False
+        self.lights[light_id] = {
+            'light_id': light_id,
+            'name': item['name'],
+            'supports_cwww': item['supports_cwww'],
+            'color_interlock': True,
+            'kind': item['kind'],
+            'type_code': type_code,
+            'did': did,
+            'location': {'x': None, 'y': None},
+        }
+        logger.info(f"Added paired lamp {did} as light {light_id} ({item['kind']})")
+        return True
 
     # --- controllers -----------------------------------------------------------
 

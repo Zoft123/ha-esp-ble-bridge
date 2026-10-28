@@ -30,7 +30,12 @@ Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE ad
   matching controls in Home Assistant.
 - **Responsive, reliable control**: the newest state for each light replaces older pending commands, every
   light gets its first packet before any repeats, and each command is repeated (configurable) so lamps that
-  miss one advertisement still get it. The radio is not shared with a BLE scanner.
+  miss one advertisement still get it. The radio is not shared with a BLE scanner (the ESP32 only scans
+  while pairing).
+- **Colors as the app sends them**: brightness, RGB and cold/warm white are encoded exactly like the BRMesh
+  app (verified against the app's own code), plus one-tap white and color presets in the web UI.
+- **Pair new lamps from the ESP32**: reset a lamp and press **Start pairing**; the controller gives it a free
+  light ID and your mesh key, the way the app does, and the lamp is added to the light list.
 - **No surprises on reboot**: restarting the ESP32 does not switch any lamps.
 - **Build and install from the add-on**: firmware is compiled in the add-on with the bundled FastCon
   components and installed on the ESP32 you choose: over USB on the Home Assistant machine, from the computer
@@ -38,8 +43,8 @@ Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE ad
 - **Several controllers**: every ESP32 can reach every light through the mesh; you can also give each
   controller its own subset of lights (for coverage, or for large meshes; one ESP32 comfortably handles about
   100 lights).
-- **Scenes and effects**, paced to what Bluetooth can deliver, and a **map view** to place lights and
-  controllers.
+- **Scenes and effects**, paced to what Bluetooth can deliver (stop them any time, or just switch a light off),
+  an **Identify** button that blinks a lamp, and a **map view** to place lights and controllers.
 
 ## Requirements
 
@@ -81,8 +86,12 @@ Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE ad
 5. **Add it to Home Assistant.** Under **Settings → Devices & Services**, add the discovered ESPHome device
    (the API key is in `/config/esphome/secrets.yaml`). Your lights appear as light entities.
 
-When you add, rename or remove lights later, import a new export (or edit the lights in the add-on), then click
-**⚡ Install** on each controller again.
+**Pairing new lamps without the app:** in the **Pairing** tab, pick a controller, reset the lamps (as for the
+BRMesh app) and click **Start pairing**. Paired lamps are added to the light list; click **⚡ Install** on each
+controller afterwards. Lamps paired this way do not appear in the BRMesh app.
+
+When you add, rename or remove lights later, import a new export, pair them, or edit the lights in the add-on,
+then click **⚡ Install** on each controller again.
 
 ## Settings
 
@@ -95,9 +104,10 @@ When you add, rename or remove lights later, import a new export (or edit the li
 
 ## Limitations
 
-- **New lights are paired with the BRMesh app**, not from the ESP32. Unpaired lights only answer the app's
-  scan request, and the app builds its pairing reply in a native library that has not been reverse
-  engineered. After pairing in the app, import a new export.
+- **Pairing from the ESP32 covers lamps with light IDs 1-255.** Lamps that answer with the app's extended
+  protocol (gateways, very large meshes) are listed but not paired. The BRMesh app does not see lamps paired
+  by the add-on, and does not know the IDs the add-on handed out: if you also pair with the app, import its
+  export first.
 - **One mesh per add-on.** The add-on uses one mesh key (the app's normal and "radar" meshes have separate keys;
   you choose which to import).
 - **Light IDs 1-255.** Lights above 255 use the app's extended addressing, which is not supported yet; they are

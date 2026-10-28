@@ -6,3 +6,4 @@
 #define ESP_LOGV(tag, ...) ((void)0)
 #define ESP_LOGD(tag, ...) ((void)0)
 #define ESP_LOGCONFIG(tag, ...) ((void)0)
+#define ESP_LOGI(tag, ...) do { if (0) printf(__VA_ARGS__); } while (0)

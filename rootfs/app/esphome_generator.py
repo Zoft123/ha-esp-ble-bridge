@@ -19,12 +19,14 @@ from state_store import ESPHOME_DIR
 
 logger = logging.getLogger(__name__)
 
-BRIDGE_FIRMWARE_VERSION = "2.0.0"
+BRIDGE_FIRMWARE_VERSION = "2.1.0"
 COMPONENTS_SRC = '/app/esphome_components'
 # Folder (relative to /config/esphome) the bundled ESPHome components are copied to.
 COMPONENTS_DIR_NAME = 'esp_ble_bridge_components'
 MANUAL_MARKERS = ("# manual_config: true", "# manual_managed: true")
 ALL_LIGHTS_NAME = 'All Lights'
+# Entity name of the controller's pairing status text sensor (fastcon pairing_status).
+PAIRING_SENSOR_NAME = 'Pairing'
 # Each light entity costs ~350 bytes of heap (LightState 248 + FastconLight 28 bytes, measured from
 # the firmware's debug info, plus name and allocator overhead). A classic ESP32 has roughly 60-90 KB
 # free with Wi-Fi, Bluetooth and the API running, so above this many lights per controller, suggest
@@ -106,7 +108,17 @@ class ESPHomeConfigGenerator:
             },
             # DEBUG logging of every packet slows the loop that sends the BLE commands.
             'logger': {'level': 'INFO'},
-            'api': {'encryption': {'key': Secret('api_encryption_key')}},
+            'api': {
+                'encryption': {'key': Secret('api_encryption_key')},
+                # Called by the add-on through Home Assistant (esphome.<device>_start_pairing).
+                'actions': [
+                    {'action': 'start_pairing',
+                     'variables': {'light_ids': 'int[]', 'seconds': 'int'},
+                     'then': [{'lambda': 'id(fastcon_controller).start_pairing(light_ids, seconds);'}]},
+                    {'action': 'stop_pairing',
+                     'then': [{'lambda': 'id(fastcon_controller).stop_pairing();'}]},
+                ],
+            },
             'ota': [{'platform': 'esphome', 'password': Secret('ota_password')}],
             'wifi': wifi,
             'captive_portal': {},
@@ -123,6 +135,7 @@ class ESPHomeConfigGenerator:
                 'adv_interval_max': int(settings.get('adv_interval_max', 0x28)),
                 'adv_duration': int(settings.get('adv_duration', 40)),
                 'repeats': int(settings.get('adv_repeats', 3)),
+                'pairing_status': {'name': PAIRING_SENSOR_NAME},
             },
         }
         if settings.get('enable_web_server'):

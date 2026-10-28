@@ -5,6 +5,7 @@
 
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "esphome/components/fastcon/fastcon_color_helpers.h"
 #include "esphome/components/fastcon/protocol.h"
 #include "esphome/components/fastcon/utils.h"
 
@@ -12,16 +13,6 @@ namespace esphome {
 namespace fastcon_group_light {
 
 static const char *const TAG = "fastcon_group_light";
-
-static inline uint8_t to_u8_(float value) {
-  if (value <= 0.0f) return 0;
-  if (value >= 1.0f) return 255;
-  return static_cast<uint8_t>(value * 255.0f + 0.5f);
-}
-
-static inline bool all_zero_(float r, float g, float b, float cw, float ww) {
-  return r == 0.0f && g == 0.0f && b == 0.0f && cw == 0.0f && ww == 0.0f;
-}
 
 void FastconGroupLight::dump_config() {
   ESP_LOGCONFIG(TAG, "FastCon Group Light:");
@@ -208,61 +199,12 @@ void FastconGroupLight::write_state(light::LightState *state) {
   }
   was_on_ = true;
 
-  const float brightness = std::min(std::max(values.get_brightness(), 0.0f), 1.0f);
-  uint8_t bri7 = static_cast<uint8_t>(brightness * 127.0f + 0.5f);
-  if (bri7 == 0)
-    bri7 = 1;
-  const uint8_t on_bri = static_cast<uint8_t>(0x80 | bri7);
-
-  // White-only command. ESPHome's current_values_as_rgbww() returns
-  // all zeros for WHITE mode — the white value lives in a separate
-  // channel that as_rgb()/as_cwww() do not read for WHITE — so it
-  // cannot be resolved that way. The app sends warm=cold=0x7F with
-  // the brightness in byte 0 (docs/GROUP_PROTOCOL.md), matching the
-  // single light's get_white_light_data().
-  if (values.get_color_mode() == light::ColorMode::WHITE) {
-    queue_group_control_({on_bri, 0x00, 0x00, 0x00, 0x7F, 0x7F});
-    ESP_LOGD(TAG, "Group white bri=%u/127 start=%u mask=0x%02X",
-             bri7, start_light_id_, mask_);
-    return;
-  }
-
-  // Resolve the channel levels for the current color mode. This
-  // handles RGB, COLD_WARM_WHITE and the combined RGB_COLD_WARM_WHITE
-  // mode, so a color-temperature change is emitted as warm/cold bytes.
-  float r = 0.0f, g = 0.0f, b = 0.0f, cw = 0.0f, ww = 0.0f;
-  state->current_values_as_rgbww(&r, &g, &b, &cw, &ww, /*constant_brightness=*/false);
-
-  // Fallback for zeroed channels (no color set): RGB/RGBW lamps
-  // have no cold/warm white LEDs, so fall back to RGB white;
-  // RGBCW/CCT lamps fall back to warm white, so the lamp is
-  // visible.
-  if (all_zero_(r, g, b, cw, ww)) {
-    switch (device_type_) {
-      case 43168:  // RGB only
-      case 43169:  // RGBW (single white, no CW/WW)
-        r = g = b = 1.0f;
-        break;
-      default:  // 43050 RGBCW, 43051 CCT, unknown (assume RGBCW)
-        ww = 1.0f;
-        break;
-    }
-  }
-
-  std::vector<uint8_t> light_data{
-      on_bri,
-      to_u8_(b),   // Blue
-      to_u8_(r),   // Red
-      to_u8_(g),   // Green
-      to_u8_(ww),  // Warm
-      to_u8_(cw),  // Cold
-  };
+  // RGB and RGBW lamps (43168, 43169) have no cold/warm white LEDs.
+  const bool supports_cwww = device_type_ != 43168 && device_type_ != 43169;
+  const auto light_data = fastcon::fastcon_light_data(values, supports_cwww);
   queue_group_control_(light_data);
-
-  ESP_LOGD(TAG,
-           "Group ON start=%u mask=0x%02X bri=%u R=%u G=%u B=%u warm=%u cold=%u",
-           start_light_id_, mask_, bri7, to_u8_(r), to_u8_(g), to_u8_(b),
-           to_u8_(ww), to_u8_(cw));
+  ESP_LOGD(TAG, "Group: bri=%u/127 B=%u R=%u G=%u warm=%u cold=%u", light_data[0] & 0x7F, light_data[1],
+           light_data[2], light_data[3], light_data[4], light_data[5]);
 }
 
 }  // namespace fastcon_group_light

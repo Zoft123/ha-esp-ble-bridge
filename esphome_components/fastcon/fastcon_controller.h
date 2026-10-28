@@ -6,6 +6,8 @@
 #include <vector>
 #include <esp_gap_ble_api.h>
 #include "esphome/core/component.h"
+#include "esphome/components/esp32_ble/ble_scan_result.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 
 namespace esphome
 {
@@ -78,6 +80,22 @@ namespace esphome
             void set_adv_gap(uint16_t val) { adv_gap_ = val; }
             void set_repeats(uint8_t val) { repeats_ = val < 1 ? 1 : val; }
 
+            // --- pairing (fastcon_pairing.cpp) ---
+            // Pairs reset lamps the way the brMesh app does: broadcast a discovery request, answer each
+            // lamp that replies with its new light ID and this controller's mesh key (encrypted with
+            // the key the lamp sent), and wait for the lamp's heartbeat from that ID.
+            // `light_ids` are the IDs the lamps may get, in order; the caller knows which are free.
+            void start_pairing(const std::vector<int32_t> &light_ids, int32_t seconds);
+            void stop_pairing();
+            bool is_pairing() const { return pairing_; }
+            void set_pairing_sensor(text_sensor::TextSensor *sensor) { pairing_sensor_ = sensor; }
+            // Called by esp32_ble for every advertisement heard while scanning.
+            void gap_scan_event_handler(const esp32_ble::BLEScanResult &scan_result);
+            void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+
+            // Scheduler key of the pairing packets (discovery request and replies).
+            static const uint32_t TARGET_PAIRING = 0x102;
+
         protected:
             struct Packet
             {
@@ -126,6 +144,36 @@ namespace esphome
 
             // Protocol implementation
             std::vector<uint8_t> generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward = true);
+            // Same, with the body encrypted with `key` and `safe_key` in the header (pairing packets).
+            std::vector<uint8_t> generate_command_with_key(uint8_t n, uint32_t light_id, const std::vector<uint8_t> &data,
+                                                           bool forward, const std::array<uint8_t, 4> &key,
+                                                           uint8_t safe_key);
+            uint8_t sequence_{0};
+
+            // --- pairing state ---
+            struct PairingLamp
+            {
+                std::array<uint8_t, 6> did{};
+                std::array<uint8_t, 4> key{};
+                uint16_t type{0};
+                uint16_t light_id{0};
+                // offered: reply being sent; ok: heartbeat received; nofree: no light ID left;
+                // unsupported: lamp needs the extended (new protocol) reply, not implemented.
+                enum class State : uint8_t { OFFERED, OK, NO_FREE_ID, UNSUPPORTED } state{State::OFFERED};
+                uint32_t last_change{0};
+            };
+            void pairing_loop_(uint32_t now);
+            void pairing_handle_frame_(const uint8_t *frame, size_t len, bool new_protocol);
+            void pairing_set_scanning_(bool on);
+            void pairing_publish_();
+            std::vector<PairingLamp> pairing_lamps_;
+            std::deque<uint16_t> pairing_free_ids_;
+            text_sensor::TextSensor *pairing_sensor_{nullptr};
+            bool pairing_{false};
+            bool scanning_{false};
+            bool pairing_dirty_{false};
+            uint32_t pairing_until_{0};
+            uint32_t pairing_last_send_{0};
 
             std::array<uint8_t, 4> mesh_key_{};
 

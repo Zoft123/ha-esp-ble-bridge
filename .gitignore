@@ -80,3 +80,6 @@ docs/
 # Never commit BRMesh exports: they contain the mesh key
 brmesh_export*.json
 BRMESH_BACKUP*
+
+# Built by tests/native_compare/native_compare.py
+tests/native_compare/fw_probe

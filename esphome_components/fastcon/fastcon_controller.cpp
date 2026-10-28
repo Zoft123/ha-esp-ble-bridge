@@ -6,6 +6,7 @@
 #include "esphome/core/log.h"
 #include "esphome/components/light/color_mode.h"
 #include "esphome/components/light/light_state.h"
+#include "fastcon_color_helpers.h"
 #include "fastcon_controller.h"
 #include "protocol.h"
 
@@ -213,6 +214,8 @@ bool FastconController::start_advertising_(const std::vector<uint8_t> &data) {
 
 void FastconController::loop() {
   const uint32_t now = millis();
+  if (this->pairing_)
+    this->pairing_loop_(now);
   {
     // Everything queued during one pass of the main loop (one write_state() call) is one
     // submission; packets queued after this point start a new one.
@@ -249,82 +252,14 @@ void FastconController::loop() {
   }
 }
 
-// --- helpers for channel resolution ---
-static inline uint8_t to8(float v) {
-  if (v < 0.0f) v = 0.0f;
-  if (v > 1.0f) v = 1.0f;
-  return static_cast<uint8_t>(v * 255.0f + 0.5f);
-}
-
-static inline bool all_zero(float r, float g, float b, float cw, float ww) {
-  return r == 0.0f && g == 0.0f && b == 0.0f && cw == 0.0f && ww == 0.0f;
-}
-
 std::vector<uint8_t> FastconController::get_light_data(light::LightState *state) {
-  // Protocol: 6 bytes when ON
-  // [0] 0x80 | (brightness 0..127)
-  // [1] Blue, [2] Red, [3] Green, [4] Warm, [5] Cold
-  // When OFF, a single 0x00 byte is returned.
-
-  auto &values = state->current_values;
-  const bool is_on = values.is_on();
-  if (!is_on) {
-    return std::vector<uint8_t>({0x00});
-  }
-
-  // Compute final channel levels from current values so brightness/color_brightness are applied.
-  float r=0, g=0, b=0, cw=0, ww=0;
-  state->current_values_as_rgbww(&r, &g, &b, &cw, &ww, /*constant_brightness=*/false);  // per ESPHome light API
-
-  // If color mode is WHITE on RGBW fixtures (no CW/WW), map to RGB white.
-  const auto mode = values.get_color_mode();
-  // Heuristic: if traits have a valid CT range, we treat device as supporting CW/WW.
-  const bool supports_cwww = state->get_traits().get_min_mireds() > 0.0f;
-
-  if ((mode == light::ColorMode::WHITE || mode == light::ColorMode::COLD_WARM_WHITE) && !supports_cwww) {
-    float m = (ww > 0 ? ww : cw);
-    r = g = b = m; cw = ww = 0.0f;
-  }
-
-  // Fallback for UNKNOWN color mode / zeroed channels: first ON should be warm white for RGBCW, RGB white otherwise.
-  if (all_zero(r,g,b,cw,ww)) {
-    if (supports_cwww) { ww = 1.0f; /* warm white */ }
-    else { r = g = b = 1.0f; }
-  }
-
-  // Compose payload
-  const float blevel = std::min(values.get_brightness() * 127.0f, 127.0f);
-  std::vector<uint8_t> light_data = {
-      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel)),
-      to8(b),  // Blue
-      to8(r),  // Red
-      to8(g),  // Green
-      to8(ww), // Warm
-      to8(cw)  // Cold
-  };
-
-  return light_data;
+  // Lamps with a color temperature range have cold/warm white LEDs.
+  return fastcon_light_data(state->current_values, state->get_traits().get_min_mireds() > 0.0f);
 }
 
-// special payload for white LED with color_interlock 
 std::vector<uint8_t> FastconController::get_white_light_data(light::LightState *state) {
-  auto &values = state->current_values;
-  const bool is_on = values.is_on();
-  if (!is_on) {
-    return std::vector<uint8_t>({0x00});
-  }
-
-  const float blevel = std::min(values.get_brightness() * 127.0f, 127.0f);
-  std::vector<uint8_t> light_data = {
-      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel)),
-      0,
-      0,
-      0,
-      127, // Warm
-      127  // Cold
-  };
-
-  return light_data;
+  // WHITE mode (RGBW lamps): the app's whiteCommand, warm = cold = 127.
+  return fastcon_light_data(state->current_values, false);
 }
 
 std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const std::vector<uint8_t> &light_data) {
@@ -343,17 +278,21 @@ std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const
 }
 
 std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward) {
-  static uint8_t sequence = 0;
+  return this->generate_command_with_key(n, light_id_, data, forward, this->mesh_key_, this->mesh_key_[3]);
+}
 
+std::vector<uint8_t> FastconController::generate_command_with_key(uint8_t n, uint32_t light_id, const std::vector<uint8_t> &data,
+                                                                  bool forward, const std::array<uint8_t, 4> &key,
+                                                                  uint8_t safe_key) {
   // Create command body with header
   std::vector<uint8_t> body(data.size() + 4);
-  uint8_t i2 = (light_id_ / 256);
+  uint8_t i2 = (light_id / 256);
 
   // Header
   body[0] = (i2 & 0b1111) | ((n & 0b111) << 4) | (forward ? 0x80 : 0);
-  body[1] = sequence++;
-  if (sequence >= 255) sequence = 1;
-  body[2] = this->mesh_key_[3];  // Safe key
+  body[1] = this->sequence_++;
+  if (this->sequence_ >= 255) this->sequence_ = 1;
+  body[2] = safe_key;
 
   // Copy data
   std::copy(data.begin(), data.end(), body.begin() + 4);
@@ -370,7 +309,7 @@ std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t lig
     body[i] = DEFAULT_ENCRYPT_KEY[i & 3] ^ body[i];
   }
   for (size_t i = 0; i < data.size(); i++) {
-    body[4 + i] = this->mesh_key_[i & 3] ^ body[4 + i];
+    body[4 + i] = key[i & 3] ^ body[4 + i];
   }
 
   // RF protocol formatting

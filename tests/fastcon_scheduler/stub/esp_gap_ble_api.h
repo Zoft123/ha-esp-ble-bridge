@@ -13,3 +13,13 @@ esp_err_t esp_ble_gap_config_adv_data_raw(uint8_t *d, uint32_t n);
 esp_err_t esp_ble_gap_start_advertising(esp_ble_adv_params_t *p);
 esp_err_t esp_ble_gap_stop_advertising();
 inline const char *esp_err_to_name(esp_err_t) { return "err"; }
+// Scanning (pairing)
+enum { BLE_SCAN_TYPE_PASSIVE, BLE_SCAN_FILTER_ALLOW_ALL, BLE_SCAN_DUPLICATE_DISABLE };
+struct esp_ble_scan_params_t { int scan_type, own_addr_type, scan_filter_policy; uint16_t scan_interval, scan_window; int scan_duplicate; };
+typedef enum { ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT, ESP_GAP_BLE_SCAN_START_COMPLETE_EVT } esp_gap_ble_cb_event_t;
+#define ESP_BT_STATUS_SUCCESS 0
+#define ESP_GAP_SEARCH_INQ_RES_EVT 0
+union esp_ble_gap_cb_param_t { struct { int status; } scan_start_cmpl; };
+esp_err_t esp_ble_gap_set_scan_params(esp_ble_scan_params_t *p);
+esp_err_t esp_ble_gap_start_scanning(uint32_t duration);
+esp_err_t esp_ble_gap_stop_scanning();

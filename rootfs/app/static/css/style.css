@@ -1297,3 +1297,58 @@ body.dark-mode .status-message.error {
 .install-option { display: block; margin: 6px 0; cursor: pointer; }
 .install-note { font-size: 0.85em; opacity: 0.8; margin: 6px 0; }
 .import-modal-content h3 { margin: 14px 0 4px; font-size: 1em; }
+
+/* --- Presets and running effects --- */
+.all-lights-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 20px;
+}
+.preset-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 10px 0;
+}
+.preset-row.compact { margin: 8px 0 0; }
+.preset-row-label { font-size: 0.85em; font-weight: bold; margin-right: 2px; }
+.preset-swatch {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 2px solid rgba(128, 128, 128, 0.45);
+    cursor: pointer;
+    padding: 0;
+}
+.preset-swatch:hover { transform: scale(1.12); }
+.preset-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 14px;
+    border: 1px solid rgba(128, 128, 128, 0.45);
+    background: transparent;
+    color: inherit;
+    font-size: 0.85em;
+    cursor: pointer;
+}
+.preset-chip:hover { border-color: #2196F3; }
+.preset-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 1px solid rgba(128, 128, 128, 0.45);
+}
+.effect-badge { color: #8e44ad; font-weight: bold; }
+body.dark-mode .effect-badge { color: #c39bd3; }
+.scene-card { position: relative; }
+.scene-delete { position: absolute; top: 10px; right: 10px; }
+.light-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* --- Pairing --- */
+.pairing-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0 8px; }
+.pairing-status { margin: 8px 0; font-weight: bold; }

@@ -5,6 +5,50 @@ All notable changes to the ESP BLE Bridge add-on will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.61.0] - 2026-10-28
+
+Controller firmware 2.1.0: install it on every controller (Controllers tab) after updating.
+
+### Added
+- **Pairing reset lamps from the ESP32** (Pairing tab). Reverse engineered from the brMesh app and its
+  native library: the controller broadcasts the app's discovery request, answers each reset lamp with a
+  free light ID and your mesh key (encrypted with the key the lamp announces), and confirms the pairing by
+  the lamp's heartbeat. Confirmed lamps are added to the Lights tab with their type. The controller scans
+  only while pairing (2 minutes), so day-to-day commands keep the radio to themselves. Lamps that answer
+  with the app's extended protocol (light IDs above 255, gateways) are listed as not supported yet.
+- **White and color presets.** Every light card has one-tap whites (Cool White 6500 K, Daylight, Neutral
+  White, Warm White 2700 K, Candle 2000 K), and the color dialog and a new "All lights" bar on the Lights
+  tab have every preset (whites plus red, orange, yellow, green, cyan, blue, purple, pink). Whites use the
+  lamp's white LEDs: color temperature on CW/WW lamps, the white channel on RGBW lamps, mixed RGB only on
+  RGB-only lamps. Before this, a lamp set to a color from the web UI could not be put back to white there.
+- **Stopping effects.** The Effects tab lists running effects with a Stop button each and a Stop all button,
+  and a "⏹ Stop effects" button appears in the header whenever an effect runs. Light cards show which
+  effect a light is in.
+- 🔦 **Identify** on each light card blinks the lamp three times and restores its previous state.
+
+### Fixed
+- **Colors and brightness now match the brMesh app** (checked against the app's own code and native
+  library). The firmware put the brightness into every color channel *and* into the brightness byte, so
+  lamps were dimmed twice: 50 % in Home Assistant gave about 25 %, and low brightness lost color precision.
+  The color bytes now carry only the color, as the app sends them. Color temperature is split the way the
+  app does (warm + cold = 255); before, a mid temperature drove both white LED strings at full power.
+  RGB-only lamps get the app's RGB white (85/85/85). This applies to single lights, "All Lights" and groups.
+- **Effects could not be stopped and switched lights back on.** Nothing in the UI called the stop endpoint,
+  so an effect ran until the add-on restarted, and every step of an effect sent "on", which undid turning
+  the light off in Home Assistant. Now an effect gives up a light when you set it on the Lights tab, apply a
+  scene to it, or switch it (or "All Lights") off anywhere in Home Assistant. An effect left without lights
+  stops.
+- The light card's On/Off button no longer resends the lamp's RGB color when switching it on, which forced
+  lamps out of white mode.
+- Scenes saved colors as `{r, g, b}` objects that could not be applied; old scenes are read either way.
+  Effect scenes listed effects that do not exist and did nothing when applied; they now start the effect.
+  Scenes can be deleted.
+
+### Removed
+- The old scan/pairing UI and its endpoints (`/api/scan`, `/api/pairing/discover`, `/api/pairing/pair`,
+  `/api/pairing/ignore`, `/api/control/send`), which never worked, and the log filters for pairing/BLE scan.
+  Pairing now lives in the Pairing tab (see Added).
+
 ## [0.60.1] - 2026-10-15
 
 ### Added
