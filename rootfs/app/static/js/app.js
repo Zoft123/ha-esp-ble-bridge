@@ -431,12 +431,14 @@ function renderPairing(result) {
   if (!result.available) {
     status.textContent = 'This controller has no pairing sensor in Home Assistant yet. Install firmware 2.1.0 or newer on it.';
     table.hidden = true;
+    $('#pairing-heard').hidden = true;
     return;
   }
   const paired = result.lamps.filter(l => l.state === 'ok').length;
   status.textContent = result.active
     ? `Looking for reset lamps… ${result.lamps.length} found, ${paired} paired.`
     : result.lamps.length ? `Pairing finished: ${paired} of ${result.lamps.length} paired.` : 'Not pairing.';
+  renderHeard(result);
   table.hidden = !result.lamps.length;
   const labels = {
     ok: 'Paired',
@@ -453,6 +455,21 @@ function renderPairing(result) {
       <td>${l.known ? 'in Lights' : (l.state === 'wait' && !result.active && l.light_id
         ? `<button class="btn small" data-add-lamp="${l.light_id}" data-did="${esc(l.did)}" data-type="${l.type_code}" title="The lamp may have joined without the controller hearing it confirm">Add anyway</button>` : '')}</td>
     </tr>`).join('');
+}
+
+// What the controller's Bluetooth scan picked up in this session (firmware 2.2.1), so "the lamps do not
+// answer" can be told from "the ESP32 does not hear them".
+function renderHeard(result) {
+  const el = $('#pairing-heard');
+  const h = result.heard;
+  el.hidden = !h;
+  if (!h) return;
+  let text = `This controller heard ${h.adverts} Bluetooth packets: ${h.fastcon} from BRMesh devices, ${h.answers} pairing answers, `
+    + `${h.heartbeats} heartbeats of your mesh key and ${h.other_mesh} of another key.`;
+  if (h.adverts === 0) text += ' Its Bluetooth scan is not picking anything up' + (h.scan_restarts ? ` (restarted ${h.scan_restarts} times)` : '') + '; restart the controller.';
+  else if (h.answers === 0 && h.fastcon === 0) text += ' No BRMesh lamp is in range of it, or none is switched on.';
+  else if (h.answers === 0) text += ' Lamps are in range but none is answering the pairing request: they are not in pairing mode.';
+  el.textContent = text;
 }
 
 async function addUnconfirmed(button) {

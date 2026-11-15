@@ -68,6 +68,12 @@ static esp32_ble::BLEScanResult advert(const std::vector<uint8_t> &frame) {
   return r;
 }
 
+// The status without its trailing "heard=..." packet counts.
+static std::string lamps_of(const std::string &state) {
+  const size_t at = state.find("heard=");
+  return at == std::string::npos ? state : state.substr(0, at);
+}
+
 static void run(Ctl &c, int ms) { for (int i = 0; i < ms; i++) { g_now++; c.loop(); } }
 
 static void test_encoding() {
@@ -108,7 +114,7 @@ static void test_pairing() {
   esp_ble_gap_cb_param_t p{};
   c.gap_event_handler(ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT, &p);
   CHECK(scanning == 1, "scanning while pairing");
-  CHECK(sensor.state == "on|", "status published");
+  CHECK(lamps_of(sensor.state) == "on|", "status published");
 
   // 1. The discovery request: type 0, 12 zero bytes, default key, key byte 0xff, no forwarding.
   sent.clear();
@@ -201,10 +207,20 @@ static void test_known_lamps_and_clear() {
   c.gap_scan_event_handler(advert(discovery_answer({0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})));
   c.gap_scan_event_handler(advert(discovery_answer({0x00, 0x11, 0x22, 0x33, 0x44, 0xff})));
   run(c, 1);
-  CHECK(sensor.state == "on|", ("known lamps are not offered an ID: " + sensor.state).c_str());
+  CHECK(lamps_of(sensor.state) == "on|", ("known lamps are not offered an ID: " + sensor.state).c_str());
   c.gap_scan_event_handler(advert(discovery_answer({0x00, 0x11, 0x22, 0x33, 0x44, 0xfe})));
   run(c, 1);
-  CHECK(sensor.state == "on|5,0011223344fe,43050,wait;", ("an unknown lamp gets the first free ID: " + sensor.state).c_str());
+  CHECK(lamps_of(sensor.state) == "on|5,0011223344fe,43050,wait;", ("an unknown lamp gets the first free ID: " + sensor.state).c_str());
+
+  // The status ends with what the scan heard: 3 adverts, all FastCon, all discovery answers.
+  run(c, 5100);
+  CHECK(sensor.state.find(";heard=3/3/3/0/0/") != std::string::npos, ("packet counts: " + sensor.state).c_str());
+  // A lamp that answers with the 24 byte frame is found too.
+  auto longer = discovery_answer({0x00, 0x11, 0x22, 0x33, 0x44, 0xfd});
+  longer.resize(24, 0);
+  c.gap_scan_event_handler(advert(longer));
+  run(c, 1);
+  CHECK(sensor.state.find("6,0011223344fd,43050,wait;") != std::string::npos, ("24 byte answer: " + sensor.state).c_str());
 
   // Clearing stops pairing and empties the list.
   c.clear_pairing();
@@ -218,7 +234,7 @@ static void test_known_lamps_and_clear() {
   c.start_pairing({5, 6}, 60);
   c.gap_scan_event_handler(advert(discovery_answer({0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})));
   run(c, 1);
-  CHECK(sensor.state == "on|5,deadbeef0001,43050,wait;", ("new session: " + sensor.state).c_str());
+  CHECK(lamps_of(sensor.state) == "on|5,deadbeef0001,43050,wait;", ("new session: " + sensor.state).c_str());
   c.clear_pairing();
 }
 

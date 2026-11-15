@@ -177,6 +177,20 @@ namespace esphome
             std::vector<PairingLamp> pairing_lamps_;
             std::deque<uint16_t> pairing_free_ids_;
             std::vector<std::array<uint8_t, 6>> pairing_known_;
+            // What the scan picked up in this session, for the status sensor: without it nobody can tell
+            // "the lamps do not answer" from "the ESP32 does not hear them".
+            struct PairingHeard
+            {
+                uint32_t adverts{0};     // every advertisement
+                uint32_t fastcon{0};     // manufacturer data of company 0xfff0
+                uint32_t answers{0};     // discovery answers, known lamps included
+                uint32_t heartbeats{0};  // heartbeats of this mesh key
+                uint32_t other_mesh{0};  // heartbeats that do not decrypt with this mesh key
+                uint32_t scan_restarts{0};
+            } pairing_heard_;
+            uint32_t pairing_stats_time_{0};
+            uint32_t pairing_scan_check_time_{0};
+            uint32_t pairing_scan_check_count_{0};
             text_sensor::TextSensor *pairing_sensor_{nullptr};
             bool pairing_{false};
             bool scanning_{false};

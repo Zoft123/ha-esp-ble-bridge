@@ -38,6 +38,10 @@ static const size_t PAIRING_MAX_LAMPS = 64;
 // The text sensor's state goes to Home Assistant, which rejects states over 255 characters.
 static const size_t PAIRING_STATUS_MAX_LEN = 250;
 static const uint16_t TYPE_GATEWAY_NEW = 43756;
+// How often the status sensor gets new packet counts while pairing.
+static const uint32_t PAIRING_STATS_INTERVAL_MS = 5000;
+// If no advertisement at all was heard for this long, the scan is started again.
+static const uint32_t PAIRING_SCAN_RETRY_MS = 4000;
 static const uint8_t DEV_CTRL_UPLOAD_PREFIX[] = {0x6d, 0xb6, 0x43, 0x68, 0x93, 0x1d};
 
 // "a1b2c3d4e5f6,0011223344ff" -> device IDs; anything that is not 12 hex digits is skipped.
@@ -81,6 +85,11 @@ void FastconController::start_pairing(const std::vector<int32_t> &light_ids, int
   this->pairing_ = true;
   this->pairing_until_ = millis() + static_cast<uint32_t>(seconds) * 1000;
   this->pairing_last_send_ = millis() - PAIRING_SEND_INTERVAL_MS;
+  this->pairing_heard_ = {};
+  this->pairing_stats_time_ = millis();
+  this->pairing_scan_check_time_ = millis();
+  this->pairing_scan_check_count_ = 0;
+  this->pairing_set_scanning_(false);  // a scan left over from the last session is restarted
   this->pairing_set_scanning_(true);
   ESP_LOGI(TAG, "Pairing for %d s, %u light IDs available, %u known lamps skipped", (int) seconds,
            (unsigned) this->pairing_free_ids_.size(), (unsigned) this->pairing_known_.size());
@@ -110,6 +119,7 @@ void FastconController::clear_pairing() {
   this->pairing_lamps_.clear();
   this->pairing_free_ids_.clear();
   this->pairing_known_.clear();
+  this->pairing_heard_ = {};
   this->pairing_lamps_.shrink_to_fit();
   this->pairing_known_.shrink_to_fit();
   ESP_LOGI(TAG, "Pairing %scleared", was_pairing ? "stopped and " : "");
@@ -166,6 +176,7 @@ void FastconController::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_
 void FastconController::gap_scan_event_handler(const esp32_ble::BLEScanResult &scan_result) {
   if (!this->pairing_ || scan_result.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT)
     return;
+  this->pairing_heard_.adverts++;
   const uint8_t *adv = scan_result.ble_adv;
   const size_t total = scan_result.adv_data_len + scan_result.scan_rsp_len;
   for (size_t i = 0; i + 1 < total;) {
@@ -177,6 +188,7 @@ void FastconController::gap_scan_event_handler(const esp32_ble::BLEScanResult &s
         adv[i + 3] == 0xff) {
       const uint8_t *data = adv + i + 4;
       const size_t data_len = len - 3;
+      this->pairing_heard_.fastcon++;
       if (data[0] == 0xa5 && data[1] == 0x5a) {
         this->pairing_handle_frame_(data + 2, data_len - 2, true);
       } else if (!std::equal(std::begin(DEV_CTRL_UPLOAD_PREFIX), std::end(DEV_CTRL_UPLOAD_PREFIX), data)) {
@@ -196,8 +208,10 @@ void FastconController::pairing_handle_frame_(const uint8_t *frame, size_t len, 
   const uint8_t type = (header[0] >> 4) & 0x07;
   const uint8_t high = header[0] & 0x0f;
 
-  if (type == 1 && len == (new_protocol ? 22u : 16u)) {
+  // Old protocol frames are 16 or 24 bytes (the app accepts both), new protocol ones 22.
+  if (type == 1 && (new_protocol ? len == 22 : (len == 16 || len == 24))) {
     // Discovery answer of a lamp in pairing mode. The body is not encrypted.
+    this->pairing_heard_.answers++;
     PairingLamp lamp;
     std::copy(frame + 4, frame + 10, lamp.did.begin());
     lamp.type = frame[10] | (frame[11] << 8);
@@ -244,7 +258,12 @@ void FastconController::pairing_handle_frame_(const uint8_t *frame, size_t len, 
       payload[i] = frame[4 + i] ^ this->mesh_key_[i & 3];
       checksum += payload[i];
     }
-    if (checksum != header[3] || (payload[0] & 0x0f) != 4)
+    if (checksum != header[3]) {
+      this->pairing_heard_.other_mesh++;  // a lamp of another mesh key
+      return;
+    }
+    this->pairing_heard_.heartbeats++;
+    if ((payload[0] & 0x0f) != 4)
       return;
     const uint16_t addr = payload[1] | (high << 8);
     for (auto &lamp : this->pairing_lamps_) {
@@ -288,6 +307,25 @@ void FastconController::pairing_loop_(uint32_t now) {
       this->queueCommand(TARGET_PAIRING, this->generate_command_with_key(0, 0, request, false, default_key, 0xff));
     }
   }
+  // No advertisement at all for seconds means the scan is not running (any home has BLE traffic).
+  if (now - this->pairing_scan_check_time_ >= PAIRING_SCAN_RETRY_MS) {
+    if (this->pairing_heard_.adverts == this->pairing_scan_check_count_) {
+      ESP_LOGW(TAG, "No Bluetooth advertisements heard, starting the scan again");
+      this->pairing_heard_.scan_restarts++;
+      this->pairing_set_scanning_(false);
+      this->pairing_set_scanning_(true);
+    }
+    this->pairing_scan_check_time_ = now;
+    this->pairing_scan_check_count_ = this->pairing_heard_.adverts;
+  }
+  if (now - this->pairing_stats_time_ >= PAIRING_STATS_INTERVAL_MS) {
+    this->pairing_stats_time_ = now;
+    this->pairing_dirty_ = true;
+    ESP_LOGI(TAG, "Heard %u advertisements, %u FastCon, %u pairing answers, %u heartbeats (%u of other meshes)",
+             (unsigned) this->pairing_heard_.adverts, (unsigned) this->pairing_heard_.fastcon,
+             (unsigned) this->pairing_heard_.answers, (unsigned) this->pairing_heard_.heartbeats,
+             (unsigned) this->pairing_heard_.other_mesh);
+  }
   if (this->pairing_dirty_)
     this->pairing_publish_();
 }
@@ -298,13 +336,21 @@ void FastconController::pairing_publish_() {
   this->pairing_dirty_ = false;
   if (this->pairing_sensor_ == nullptr)
     return;
-  // "on|<light id>,<device id>,<type>,<state>;..." with the most recently changed lamps first.
+  // "on|<light id>,<device id>,<type>,<state>;...;heard=<adverts>/<fastcon>/<answers>/<heartbeats>/
+  // <other mesh heartbeats>/<scan restarts>;" with the most recently changed lamps first. The counts
+  // say what the scan picked up in this session.
   std::vector<const PairingLamp *> lamps;
   for (auto &lamp : this->pairing_lamps_)
     lamps.push_back(&lamp);
   std::stable_sort(lamps.begin(), lamps.end(),
                    [](const PairingLamp *a, const PairingLamp *b) { return a->last_change > b->last_change; });
   std::string out = this->pairing_ ? "on|" : "off|";
+  char heard[72] = "";
+  if (this->pairing_ || !this->pairing_lamps_.empty() || this->pairing_heard_.adverts != 0)
+    snprintf(heard, sizeof(heard), "heard=%u/%u/%u/%u/%u/%u;", (unsigned) this->pairing_heard_.adverts,
+             (unsigned) this->pairing_heard_.fastcon, (unsigned) this->pairing_heard_.answers,
+             (unsigned) this->pairing_heard_.heartbeats, (unsigned) this->pairing_heard_.other_mesh,
+             (unsigned) this->pairing_heard_.scan_restarts);
   for (const PairingLamp *lamp : lamps) {
     const char *state = lamp->state == PairingLamp::State::OK           ? "ok"
                         : lamp->state == PairingLamp::State::OFFERED    ? "wait"
@@ -313,10 +359,11 @@ void FastconController::pairing_publish_() {
     char entry[48];
     snprintf(entry, sizeof(entry), "%u,%02x%02x%02x%02x%02x%02x,%u,%s;", lamp->light_id, lamp->did[0], lamp->did[1],
              lamp->did[2], lamp->did[3], lamp->did[4], lamp->did[5], lamp->type, state);
-    if (out.size() + strlen(entry) > PAIRING_STATUS_MAX_LEN)
+    if (out.size() + strlen(entry) + strlen(heard) > PAIRING_STATUS_MAX_LEN)
       break;
     out += entry;
   }
+  out += heard;
   this->pairing_sensor_->publish_state(out);
 }
 

@@ -4,6 +4,20 @@ What changed in each version of ESP BLE Bridge, newest first. Versions follow [S
 Releases before 0.60.0 belong to the original project by Chris Valentino; their history is in
 [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge).
 
+## [0.63.1] - 2026-11-15
+
+Controller firmware 2.2.1: install it on every controller (Controllers tab) after updating.
+
+### Added
+- The Pairing tab shows what the controller's Bluetooth scan picked up: all packets, packets from BRMesh
+  devices, pairing answers and heartbeats. It tells "the lamps are not answering" from "the ESP32 does not
+  hear them".
+
+### Fixed
+- The controller starts its Bluetooth scan again when it hears nothing at all for a few seconds, and at the
+  start of every pairing session.
+- Lamps that answer the pairing request with the 24-byte frame were ignored (the app accepts 16 and 24 bytes).
+
 ## [0.63.0] - 2026-11-15
 
 Controller firmware 2.2.0: install it on every controller (Controllers tab) after updating.

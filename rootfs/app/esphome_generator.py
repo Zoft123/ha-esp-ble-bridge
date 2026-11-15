@@ -17,7 +17,7 @@ from state_store import ESPHOME_DIR
 
 log = getLogger(__name__)
 
-BRIDGE_FIRMWARE_VERSION = "2.2.0"
+BRIDGE_FIRMWARE_VERSION = "2.2.1"
 COMPONENTS_SRC = '/app/esphome_components'
 # Folder, inside /config/esphome, that the bundled ESPHome components are copied to.
 COMPONENTS_DIR_NAME = 'esp_ble_bridge_components'

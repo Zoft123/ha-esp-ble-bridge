@@ -21,7 +21,7 @@ from state_store import StateStore
 basicConfig(level=INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = getLogger('esp_ble_bridge')
 
-ADDON_VERSION = '0.63.0'
+ADDON_VERSION = '0.63.1'
 
 
 class BRMeshBridge:
@@ -341,11 +341,18 @@ class BRMeshBridge:
                        if s.get('entity_id', '').startswith('sensor.') and
                        str(s.get('attributes', {}).get('friendly_name', '')).endswith(PAIRING_SENSOR_NAME)), None)
         if entity is None:
-            return {'available': False, 'active': False, 'lamps': [], 'added': []}
+            return {'available': False, 'active': False, 'lamps': [], 'added': [], 'heard': None}
         memory = self._pairing_memory(controller)
         active, _, entries = str(entity.get('state', '')).partition('|')
-        lamps, added, remembered = [], [], False
+        lamps, added, remembered, heard = [], [], False, None
         for entry in filter(None, entries.split(';')):
+            if entry.startswith('heard='):
+                # Firmware 2.2.1: what the controller's scan picked up in this session.
+                counts = entry[6:].split('/')
+                names = ('adverts', 'fastcon', 'answers', 'heartbeats', 'other_mesh', 'scan_restarts')
+                if len(counts) == len(names) and all(c.isdigit() for c in counts):
+                    heard = dict(zip(names, map(int, counts)))
+                continue
             parts = entry.split(',')
             if len(parts) != 4:
                 continue
@@ -371,7 +378,7 @@ class BRMeshBridge:
             self.lights_changed()
         elif remembered:
             self.save_config()
-        return {'available': True, 'active': active == 'on', 'lamps': lamps, 'added': added}
+        return {'available': True, 'active': active == 'on', 'lamps': lamps, 'added': added, 'heard': heard}
 
     def mark_pairing_handled(self, did: str, light_id: int):
         """A lamp added by hand from a pairing list ("Add anyway") counts as handled on every controller."""

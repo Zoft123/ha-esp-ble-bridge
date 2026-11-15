@@ -99,6 +99,14 @@ class PairingTest(unittest.TestCase):
         b.start_pairing(self.controller, 60)
         self.assertEqual(b.ha.calls[-1][2]['known_lamps'], 'a1b2c3d4e5f6')
 
+    def test_packet_counts_are_reported(self):
+        b = self.make('on|3,a1b2c3d4e5f6,43169,ok;heard=120/14/3/9/2/0;')
+        status = b.pairing_status(self.controller)
+        self.assertEqual(status['added'], [3])
+        self.assertEqual(status['heard'], {'adverts': 120, 'fastcon': 14, 'answers': 3, 'heartbeats': 9,
+                                           'other_mesh': 2, 'scan_restarts': 0})
+        self.assertIsNone(self.make('off|').pairing_status(self.controller)['heard'])
+
     def test_non_light_device_is_not_added(self):
         b = self.make('off|5,a1b2c3d4e5f6,44181,ok;')  # a socket/relay
         self.assertEqual(b.pairing_status(self.controller)['added'], [])
