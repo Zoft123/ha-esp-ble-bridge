@@ -21,7 +21,7 @@ from state_store import StateStore
 basicConfig(level=INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = getLogger('esp_ble_bridge')
 
-ADDON_VERSION = '0.62.1'
+ADDON_VERSION = '0.63.0'
 
 
 class BRMeshBridge:
@@ -268,20 +268,73 @@ class BRMeshBridge:
         """Light IDs no known lamp uses, lowest first."""
         return [i for i in range(1, 256) if i not in self.lights][:limit]
 
+    def _pairing_memory(self, controller: Dict) -> Dict:
+        """What the add-on did with a controller's pairing list: entries added and entries hidden."""
+        memory = self.store.data.setdefault('pairing', {})
+        entry = memory.setdefault(controller_slug(controller['name']), {})
+        entry.setdefault('handled', [])
+        entry.setdefault('hidden', [])
+        return entry
+
+    @staticmethod
+    def _pairing_key(did: str, light_id: int) -> str:
+        return f"{str(did).lower()}:{int(light_id or 0)}"
+
+    def known_device_ids(self) -> List[str]:
+        """Device IDs of the lamps in the light list, for the controller to skip while pairing."""
+        dids = set()
+        for light in self.lights.values():
+            did = str(light.get('did') or '').strip().lower()
+            if len(did) == 12 and all(ch in '0123456789abcdef' for ch in did):
+                dids.add(did)
+        return sorted(dids)
+
     def start_pairing(self, controller: Dict, seconds: int = 120) -> bool:
         ids = self.free_light_ids()
         if not ids:
             raise ValueError('All 255 light IDs are in use')
-        return self.ha.call_service('esphome', self._pairing_service(controller, 'start_pairing'),
-                                    {'light_ids': ids, 'seconds': int(seconds)})
+        data = {'light_ids': ids, 'seconds': int(seconds)}
+        service = self._pairing_service(controller, 'start_pairing')
+        # Firmware 2.2.0 skips the lamps the add-on already has (paired lamps answer the discovery too).
+        accepted = self.ha.call_service('esphome', service, {**data, 'known_lamps': ','.join(self.known_device_ids())})
+        if not accepted:
+            accepted = self.ha.call_service('esphome', service, data)  # firmware 2.1.x has no known_lamps
+            if accepted:
+                logger.warning(f"{controller['name']} runs firmware older than 2.2.0: lamps already in the add-on "
+                               f"are not skipped while pairing. Install the current firmware on it.")
+        if accepted:
+            # A new session: the controller starts a new list.
+            memory = self._pairing_memory(controller)
+            memory['handled'], memory['hidden'] = [], []
+            self.save_config()
+        return accepted
 
     def stop_pairing(self, controller: Dict) -> bool:
         return self.ha.call_service('esphome', self._pairing_service(controller, 'stop_pairing'), {})
+
+    def clear_pairing(self, controller: Dict) -> Dict:
+        """Stop pairing and empty the controller's pairing list.
+
+        Lamps it confirmed that are not in the light list yet are added first, so none is lost. Firmware
+        2.2.0 forgets the list itself; for older firmware the add-on hides the entries it lists now.
+        """
+        status = self.pairing_status(controller)
+        cleared = self.ha.call_service('esphome', self._pairing_service(controller, 'clear_pairing'), {})
+        if not cleared and status.get('active'):
+            self.stop_pairing(controller)
+        memory = self._pairing_memory(controller)
+        for lamp in status.get('lamps', []):
+            key = self._pairing_key(lamp['did'], lamp['light_id'])
+            if key not in memory['hidden']:
+                memory['hidden'].append(key)
+        self.save_config()
+        return {'controller': controller['name'], 'cleared_on_controller': cleared, 'added': status.get('added', [])}
 
     def pairing_status(self, controller: Dict) -> Dict:
         """What the controller's pairing sensor reports; lamps it confirmed are added to the light list.
 
         The sensor reads "on|<light id>,<device id>,<type>,<state>;..." (state ok, wait, nofree or unsup).
+        Each confirmed lamp is added once per pairing session: a light removed afterwards stays removed.
         """
         self.ha.states(max_age=1.0)
         entity = next((s for s in self.ha.controller_entities(controller['name'])
@@ -289,27 +342,78 @@ class BRMeshBridge:
                        str(s.get('attributes', {}).get('friendly_name', '')).endswith(PAIRING_SENSOR_NAME)), None)
         if entity is None:
             return {'available': False, 'active': False, 'lamps': [], 'added': []}
+        memory = self._pairing_memory(controller)
         active, _, entries = str(entity.get('state', '')).partition('|')
-        lamps, added = [], []
+        lamps, added, remembered = [], [], False
         for entry in filter(None, entries.split(';')):
             parts = entry.split(',')
             if len(parts) != 4:
                 continue
             try:
-                light_id, did, type_code, state = int(parts[0]), parts[1], int(parts[2]), parts[3]
+                light_id, did, type_code, state = int(parts[0]), parts[1].lower(), int(parts[2]), parts[3]
             except ValueError:
+                continue
+            key = self._pairing_key(did, light_id)
+            if key in memory['hidden']:
                 continue
             lamp = {'light_id': light_id or None, 'did': did, 'type_code': type_code, 'state': state,
                     'known': light_id in self.lights}
-            if state == 'ok' and light_id and light_id not in self.lights and self.add_paired_light(light_id, did, type_code):
-                added.append(light_id)
-                lamp['known'] = True
+            if state == 'ok' and light_id and key not in memory['handled']:
+                memory['handled'].append(key)
+                remembered = True
+                if light_id not in self.lights and self.add_paired_light(light_id, did, type_code):
+                    added.append(light_id)
+                    lamp['known'] = True
             info = classify_device(1, None, type_code)  # type only
             lamp['type_label'] = info.get('type_label') or info.get('skip_reason')
             lamps.append(lamp)
         if added:
             self.lights_changed()
+        elif remembered:
+            self.save_config()
         return {'available': True, 'active': active == 'on', 'lamps': lamps, 'added': added}
+
+    def mark_pairing_handled(self, did: str, light_id: int):
+        """A lamp added by hand from a pairing list ("Add anyway") counts as handled on every controller."""
+        key = self._pairing_key(did, light_id)
+        for controller in self.controllers:
+            memory = self._pairing_memory(controller)
+            if key not in memory['handled']:
+                memory['handled'].append(key)
+
+    # --- removing lights ---------------------------------------------------------
+
+    def remove_lights(self, light_ids: List[int]) -> List[dict]:
+        """Forget lights, like deleting them in the BRMesh app (which sends nothing to the lamp either).
+
+        The lamps keep their mesh key and light ID until they are paired again: the app's scan, and the
+        controllers' pairing, list a lamp that is in neither device list. Their entries disappear from the
+        pairing lists, and controllers, scenes and effects let go of them.
+        """
+        removed = []
+        for light_id in dict.fromkeys(int(i) for i in light_ids):
+            light = self.lights.pop(light_id, None)
+            if light is not None:
+                removed.append(light)
+                self._requested.pop(light_id, None)
+        if not removed:
+            return []
+        gone = {light['light_id'] for light in removed}
+        self.effects.release_lights(sorted(gone))
+        for controller in self.controllers:
+            if controller.get('light_ids') is not None:
+                controller['light_ids'] = [i for i in controller['light_ids'] if i not in gone]
+            memory = self._pairing_memory(controller)
+            keys = {key for key in memory['handled'] if int(key.rpartition(':')[2] or 0) in gone}
+            keys.update(self._pairing_key(light['did'], light['light_id']) for light in removed if light.get('did'))
+            memory['hidden'].extend(sorted(keys - set(memory['hidden'])))
+        for scene in self.store.data.get('scenes', []):
+            if isinstance(scene.get('lights'), list):
+                scene['lights'] = [item for item in scene['lights'] if not (
+                    isinstance(item, dict) and item.get('light_id', item.get('id')) in gone)]
+        self.lights_changed()
+        logger.info(f"Removed {len(removed)} light(s): {', '.join(str(l['light_id']) for l in removed)}")
+        return removed
 
     def add_paired_light(self, light_id: int, did: str, type_code: int) -> bool:
         """Add a lamp a controller paired. Saving and regenerating is left to the caller."""

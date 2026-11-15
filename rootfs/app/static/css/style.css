@@ -406,3 +406,13 @@ dialog::backdrop { background: rgba(10, 12, 20, 0.55); }
   .two, .three { grid-template-columns: 1fr; }
   .grid, .grid.wide { grid-template-columns: 1fr; }
 }
+
+/* Selecting lights to remove several at once */
+.toolbar .push { margin-left: auto; }
+.selection-bar { padding: 8px 10px; border: 1px solid var(--danger); border-radius: var(--radius); background: var(--surface); }
+.card.selectable { cursor: pointer; position: relative; }
+.card.selectable .card-actions, .card.selectable .dots { opacity: 0.4; pointer-events: none; }
+.card.selectable .color-bar { pointer-events: none; }
+.card .pick-box { width: 20px; height: 20px; flex: none; accent-color: var(--danger); pointer-events: none; }
+.card.selected { border-color: var(--danger); box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 35%, transparent); }
+.card-head .grow { flex: 1; min-width: 0; }

@@ -44,6 +44,14 @@
         <button class="btn small" data-action="all-on">On</button>
         <button class="btn small" data-action="all-off">Off</button>
         <div class="chips" id="all-presets"></div>
+        <button class="btn small push" data-action="select-lights" id="select-lights">Select…</button>
+      </div>
+      <div class="toolbar selection-bar" id="selection-bar" hidden>
+        <span class="label" id="selection-count">0 selected</span>
+        <button class="btn small" data-action="select-all-lights">All</button>
+        <button class="btn small" data-action="select-no-lights">None</button>
+        <button class="btn small danger" data-action="remove-selected" id="remove-selected" disabled>Remove selected</button>
+        <button class="btn small" data-action="select-done">Done</button>
       </div>
       <div class="notice" id="lights-empty" hidden>
         No lights yet. <button class="link" data-action="open-import">Import your BRMesh export</button>
@@ -56,9 +64,9 @@
     <section class="panel" id="tab-pairing" hidden>
       <h2>Pair new lamps</h2>
       <ol class="steps">
-        <li>Reset the lamps you want to add, as you would before pairing them with the BRMesh app
-          (for most lamps: switch the power off and on 5 times, about a second each, until it blinks).
-          Lamps that are paired with the app have to be reset first.</li>
+        <li>Get the lamps ready: delete them in the BRMesh app (or remove them here) if they are paired already,
+          or reset new or unknown lamps (for most lamps: switch the power off and on 5 times, about a second each,
+          until it blinks). Lamps that are in the add-on's light list are skipped.</li>
         <li>Choose the controller closest to the lamps and start pairing. For two minutes it looks for reset lamps
           and gives each a free light ID and your mesh key.</li>
         <li>Paired lamps appear under Lights. Install the firmware on your controllers afterwards so Home Assistant
@@ -69,12 +77,15 @@
         <select id="pairing-controller"></select>
         <button class="btn primary" id="pairing-start">Start pairing</button>
         <button class="btn danger" id="pairing-stop" hidden>Stop</button>
+        <button class="btn" id="pairing-clear" title="Stop pairing and empty this controller's list">Clear list</button>
       </div>
       <p class="status-line" id="pairing-status"></p>
       <div class="table-wrap"><table class="table" id="pairing-table" hidden></table></div>
-      <p class="muted small">Needs controller firmware 2.1.0 or newer. Lamps paired here do not show up in the BRMesh
-        app, and the app does not know which IDs were handed out here; if you also pair with the app, import its export
-        first. Lamps that answer with the app's extended protocol are listed but cannot be paired yet.</p>
+      <p class="muted small">Needs controller firmware 2.1.0 or newer; 2.2.0 skips the lamps already in the light list
+        and empties the controller's list on Clear. Lamps paired here do not show up in the BRMesh app, and the app does
+        not know which IDs were handed out here; if you also pair with the app, import its export first. To move a lamp
+        to the BRMesh app (or another phone), remove it under Lights and add it in the app. Lamps that answer with the
+        app's extended protocol are listed but cannot be paired yet.</p>
     </section>
 
     <!-- Controllers -->
@@ -202,6 +213,13 @@
 
         <fieldset class="danger-zone">
           <legend>Danger zone</legend>
+          <p class="muted small"><strong>Start pairing over:</strong> remove every light (controllers, scenes and
+            settings stay) and empty the pairing list of every controller. The lamps can then be paired again here
+            or in the BRMesh app.</p>
+          <div class="row">
+            <button type="button" class="btn danger" data-action="remove-all-lights">Remove all lights</button>
+            <button type="button" class="btn" data-action="reset-pairing">Clear all pairing lists</button>
+          </div>
           <p class="muted small">Removes every light, controller and scene from the add-on and deletes the controllers'
             configuration files. Settings and Wi-Fi networks are kept.</p>
           <button type="button" class="btn danger" data-action="system-reset">Remove everything</button>

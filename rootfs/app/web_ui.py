@@ -225,13 +225,26 @@ class WebUI:
 
         @app.post('/api/lights/<int:light_id>/unpair')
         def remove_light(light_id):
-            light = br.lights.pop(light_id, None)
-            if light is None:
+            if light_id not in br.lights:
                 return error('Light not found', 404)
-            br.effects.release_lights([light_id])
-            br.lights_changed()
-            return ok(message=f"Removed light {light_id} ({light['name']}). Install the firmware on the controllers "
-                              f"to drop its entity.")
+            light = br.remove_lights([light_id])[0]
+            return ok(removed=[light_id], message=f"Removed light {light_id} ({light['name']}). Install the firmware "
+                                                  f"on the controllers to drop its entity.")
+
+        @app.post('/api/lights/remove')
+        def remove_lights():
+            """Remove several lights: {"light_ids": [...]}, or {"all": true} for every light."""
+            data = body()
+            if data.get('all') is True:
+                ids = sorted(br.lights)
+            else:
+                ids = [i for i in (self.id_list(data.get('light_ids')) or []) if i in br.lights]
+            if not ids:
+                return error('No lights selected')
+            removed = [light['light_id'] for light in br.remove_lights(ids)]
+            return ok(removed=removed, remaining=len(br.lights),
+                      message=f"Removed {len(removed)} light(s). Install the firmware on the controllers to drop "
+                              f"their entities.")
 
         @app.get('/api/presets')
         def presets():
@@ -331,6 +344,7 @@ class WebUI:
             if c is None:
                 return error('Controller not found', 404)
             br.controllers = [other for other in br.controllers if other is not c]
+            br.store.data.get('pairing', {}).pop(controller_slug(c['name']), None)
             br.save_config()
             path = br.esphome_generator.config_path(c)
             if os.path.exists(path):
@@ -527,8 +541,25 @@ class WebUI:
                 return error(f'Light ID {light_id} is not free')
             if not br.add_paired_light(light_id, str(data.get('did') or ''), type_code):
                 return error('This device is not a light the add-on can control')
+            br.mark_pairing_handled(str(data.get('did') or ''), light_id)
             br.lights_changed()
             return ok()
+
+        @app.post('/api/pairing/clear')
+        def pairing_clear():
+            """Stop pairing and empty the pairing list of one controller, or of all with {"all": true}."""
+            data = {**request.args, **body()}
+            if flag(data, 'all'):
+                targets = list(br.controllers)
+            else:
+                c, _ = pairing_target()
+                targets = [c] if c else []
+            if not targets:
+                return error('Controller not found', 404)
+            results = [br.clear_pairing(c) for c in targets]
+            added = sorted({i for r in results for i in r['added']})
+            return ok(cleared=[r['controller'] for r in results], added=added,
+                      old_firmware=[r['controller'] for r in results if not r['cleared_on_controller']])
 
         # Effects and scenes
 
@@ -657,7 +688,7 @@ class WebUI:
                 if os.path.exists(path):
                     os.remove(path)
             br.lights.clear()
-            br.store.data.update(controllers=[], scenes=[], groups=[])
+            br.store.data.update(controllers=[], scenes=[], groups=[], pairing={})
             br.save_config()
             return ok(message='Removed all lights, controllers and scenes.')
 

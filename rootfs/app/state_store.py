@@ -25,6 +25,9 @@ DEFAULT_STATE: Dict[str, Any] = {
     'controllers': [],
     'groups': [],
     'scenes': [],
+    # Per controller (slug): pairing list entries ("<device id>:<light id>") the add-on already added
+    # ("handled") or no longer shows ("hidden"). Both are reset when pairing starts.
+    'pairing': {},
     'settings': {
         'map_enabled': True,
         'latitude': 0.0,

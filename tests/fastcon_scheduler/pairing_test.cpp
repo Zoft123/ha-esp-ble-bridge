@@ -181,9 +181,51 @@ static void test_pairing() {
   CHECK(sensor.state.rfind("off|", 0) == 0, "status says off");
 }
 
+// Discovery answer of a lamp with device ID `did` (type 43050, any key).
+static std::vector<uint8_t> discovery_answer(const std::array<uint8_t, 6> &did) {
+  std::vector<uint8_t> frame = {0x10, 0x05, 0x00, 0x00};
+  frame.insert(frame.end(), did.begin(), did.end());
+  frame.insert(frame.end(), {0x2a, 0xa8, 0xa1, 0xb2, 0xc3, 0xd4});
+  for (int i = 0; i < 4; i++) frame[i] ^= DEFAULT_ENCRYPT_KEY[i];
+  return frame;
+}
+
+static void test_known_lamps_and_clear() {
+  Ctl c;
+  c.set_mesh_key({0x11, 0x22, 0x33, 0x44});
+  esphome::text_sensor::TextSensor sensor;
+  c.set_pairing_sensor(&sensor);
+
+  // Lamps the add-on already has answer the discovery request too; they keep their ID.
+  c.start_pairing({5, 6}, 60, "DEADBEEF0001, 0011223344ff,bad,0011223344ffee");
+  c.gap_scan_event_handler(advert(discovery_answer({0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})));
+  c.gap_scan_event_handler(advert(discovery_answer({0x00, 0x11, 0x22, 0x33, 0x44, 0xff})));
+  run(c, 1);
+  CHECK(sensor.state == "on|", ("known lamps are not offered an ID: " + sensor.state).c_str());
+  c.gap_scan_event_handler(advert(discovery_answer({0x00, 0x11, 0x22, 0x33, 0x44, 0xfe})));
+  run(c, 1);
+  CHECK(sensor.state == "on|5,0011223344fe,43050,wait;", ("an unknown lamp gets the first free ID: " + sensor.state).c_str());
+
+  // Clearing stops pairing and empties the list.
+  c.clear_pairing();
+  CHECK(!c.is_pairing() && scanning == 0, "clear stops pairing");
+  CHECK(sensor.state == "off|", ("cleared status: " + sensor.state).c_str());
+  sent.clear();
+  run(c, 3000);
+  CHECK(sent.empty(), "nothing is sent after clearing");
+
+  // A new session without a known list finds the previously skipped lamp.
+  c.start_pairing({5, 6}, 60);
+  c.gap_scan_event_handler(advert(discovery_answer({0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})));
+  run(c, 1);
+  CHECK(sensor.state == "on|5,deadbeef0001,43050,wait;", ("new session: " + sensor.state).c_str());
+  c.clear_pairing();
+}
+
 int main() {
   test_encoding();
   test_pairing();
+  test_known_lamps_and_clear();
   printf(failures ? "%d FAILURE(S)\n" : "ALL OK\n", failures);
   return failures ? 1 : 0;
 }

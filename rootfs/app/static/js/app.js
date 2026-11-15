@@ -36,6 +36,8 @@ const state = {
   jobsWatched: new Set(),
   outputFor: null,
   pairingTimer: null,
+  selecting: false,
+  selected: new Set(),
   map: null,
   markers: new Map(),
 };
@@ -161,6 +163,8 @@ async function loadLights() {
   const lights = await api('api/lights').catch(() => null);
   if (!lights) return;
   state.lights = lights;
+  const known = new Set(lights.map(l => l.id));
+  state.selected.forEach(id => { if (!known.has(id)) state.selected.delete(id); });
   renderLights();
   renderEffectLights();
   renderRunning();  // names the lights of running effects
@@ -184,6 +188,10 @@ function effectOf(lightId) {
 function renderLights() {
   const grid = $('#light-grid');
   $('#lights-empty').hidden = state.lights.length > 0;
+  if (!state.lights.length) state.selecting = false;
+  $('#select-lights').hidden = !state.lights.length || state.selecting;
+  $('#selection-bar').hidden = !state.selecting;
+  updateSelectionBar();
   const whites = state.presets.filter(p => p.kelvin);
   grid.innerHTML = state.lights.map(light => {
     const s = light.state || {};
@@ -192,10 +200,12 @@ function renderLights() {
     if (light.on_controller === false) notes.push('<span class="warn">not on any controller</span>');
     else if (!s.entity_id) notes.push('<span class="warn">not in Home Assistant yet</span>');
     if (effect) notes.push(`<span class="effect">✨ ${esc(effect.effect.replace('_', ' '))}</span>`);
+    const picked = state.selecting && state.selected.has(light.id);
     return `
-      <article class="card ${s.state ? 'is-on' : ''}" data-light="${light.id}">
+      <article class="card ${s.state ? 'is-on' : ''} ${state.selecting ? 'selectable' : ''} ${picked ? 'selected' : ''}" data-light="${light.id}">
         <div class="card-head">
-          <div>
+          ${state.selecting ? `<input type="checkbox" class="pick-box" tabindex="-1" aria-label="Select ${esc(light.name)}" ${picked ? 'checked' : ''}>` : ''}
+          <div class="grow">
             <div class="card-title">${esc(light.name)}</div>
             <div class="meta">ID ${light.id}${light.kind ? ' · ' + esc(light.kind.toUpperCase()) : ''}${notes.length ? ' · ' + notes.join(' · ') : ''}</div>
           </div>
@@ -289,12 +299,60 @@ async function lightMenu(light) {
       toast(`Watch for ${light.name} blinking three times`, 'info');
     }
   } else if (result === 'remove') {
-    if (await confirmDialog('Remove light', `Remove ${light.name} (ID ${light.id}) from the add-on? The lamp itself stays paired; install the firmware afterwards to drop its entity.`, 'Remove', true)
-        && await attempt(api(`api/lights/${light.id}/unpair`, { method: 'POST', body: {} }), 'Could not remove')) {
-      toast(`${light.name} removed`, 'ok');
-      loadLights();
-    }
+    await removeLights([light.id]);
   }
+}
+
+// --- removing lights ---------------------------------------------------------------
+
+const REMOVE_NOTE = 'Like deleting a lamp in the BRMesh app, nothing is sent to the lamp: it keeps working until it is '
+  + 'paired again, and can then be added in the BRMesh app (or on another phone) or paired here again. '
+  + 'Install the firmware on your controllers afterwards to drop the Home Assistant entities.';
+
+async function removeLights(ids, { all = false } = {}) {
+  const count = all ? state.lights.length : ids.length;
+  if (!count) return false;
+  const what = count === 1 && !all ? `${lightName(ids[0])} (ID ${ids[0]})` : `${all ? 'all ' : ''}${count} lights`;
+  if (!await confirmDialog(count === 1 && !all ? 'Remove light' : 'Remove lights', `Remove ${what} from the add-on? ${REMOVE_NOTE}`, 'Remove', true)) return false;
+  const result = await attempt(api('api/lights/remove', { method: 'POST', body: all ? { all: true } : { light_ids: ids } }), 'Could not remove');
+  if (!result) return false;
+  result.removed.forEach(id => state.selected.delete(id));
+  toast(result.message, 'ok', 8000);
+  await loadLights();
+  loadControllers();
+  return true;
+}
+
+function updateSelectionBar() {
+  const n = state.selected.size;
+  $('#selection-count').textContent = `${n} selected`;
+  $('#remove-selected').disabled = !n;
+  $('#remove-selected').textContent = n ? `Remove ${n}` : 'Remove selected';
+}
+
+function setSelecting(on) {
+  state.selecting = on;
+  if (!on) state.selected.clear();
+  renderLights();
+}
+
+function toggleSelected(id) {
+  if (state.selected.has(id)) state.selected.delete(id);
+  else state.selected.add(id);
+  renderLights();
+}
+
+async function removeSelected() {
+  if (await removeLights([...state.selected])) setSelecting(false);
+}
+
+async function removeAllLights() {
+  if (!state.lights.length) {
+    toast('There are no lights to remove', 'info');
+    return;
+  }
+  if (!await removeLights([], { all: true })) return;
+  if (state.controllers.length) await clearPairing({ all: true, quiet: true });
 }
 
 function renderPresetChips() {
@@ -325,6 +383,21 @@ async function startPairing() {
     toast(`${result.controller} is looking for reset lamps for ${result.seconds} s`, 'ok');
     schedulePairing(1000);
   }
+}
+
+async function clearPairing({ all = false, quiet = false } = {}) {
+  const controller = $('#pairing-controller').value;
+  if (!all && !controller) return;
+  const result = await attempt(api('api/pairing/clear', { method: 'POST', body: all ? { all: true } : { controller } }), 'Could not clear the pairing list');
+  if (!result) return;
+  if (result.added.length) {
+    toast(`Added light ${result.added.join(', ')} before clearing: it had been paired.`, 'ok', 8000);
+    loadLights();
+  }
+  const old = result.old_firmware.length ? ` ${result.old_firmware.join(', ')} still lists them in Home Assistant until it runs firmware 2.2.0.` : '';
+  if (!quiet || old) toast(`Pairing list cleared on ${result.cleared.join(', ')}.${old}`, old ? 'warn' : 'ok', 8000);
+  else toast('Pairing lists cleared.', 'ok');
+  schedulePairing(1500);
 }
 
 async function stopPairing() {
@@ -1118,10 +1191,28 @@ const ACTIONS = {
     }
   },
   'system-reset': systemReset,
+  'select-lights': () => setSelecting(true),
+  'select-done': () => setSelecting(false),
+  'select-all-lights': () => { state.lights.forEach(l => state.selected.add(l.id)); renderLights(); },
+  'select-no-lights': () => { state.selected.clear(); renderLights(); },
+  'remove-selected': removeSelected,
+  'remove-all-lights': removeAllLights,
+  'reset-pairing': async () => {
+    if (!state.controllers.length) {
+      toast('There are no controllers', 'info');
+      return;
+    }
+    if (await confirmDialog('Clear pairing lists', 'Stop pairing on every controller and empty their lists of found lamps? Lamps that were paired stay in the light list.', 'Clear'))
+      await clearPairing({ all: true });
+  },
 };
 
 function bindEvents() {
   document.addEventListener('click', async event => {
+    if (state.selecting) {
+      const card = event.target.closest('#light-grid [data-light]');
+      if (card) return toggleSelected(Number(card.dataset.light));
+    }
     const target = event.target.closest('button, [data-place], .color-bar');
     if (!target) return;
     const d = target.dataset;
@@ -1168,6 +1259,7 @@ function bindEvents() {
   $('#theme-toggle').addEventListener('click', toggleTheme);
   $('#pairing-start').addEventListener('click', startPairing);
   $('#pairing-stop').addEventListener('click', stopPairing);
+  $('#pairing-clear').addEventListener('click', () => clearPairing());
   $('#pairing-controller').addEventListener('change', pollPairing);
   $('#settings-form').addEventListener('submit', saveSettings);
   $('#address-query').addEventListener('keydown', event => {

@@ -1,6 +1,7 @@
 """Tests for the add-on side of pairing (python3 -m unittest discover tests)."""
 import os
 import sys
+import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'rootfs', 'app'))
@@ -42,6 +43,11 @@ class PairingTest(unittest.TestCase):
         b.lights = {i: {'light_id': i, 'name': f'L{i}', 'kind': 'rgbcw'} for i in lights}
         b.changed = 0
         b.lights_changed = lambda: setattr(b, 'changed', b.changed + 1)
+        b.store = types.SimpleNamespace(data={'controllers': [{'name': 'Living Room ESP', 'light_ids': None}],
+                                              'scenes': [], 'pairing': {}})
+        b.save_config = lambda: None
+        b._requested = {}
+        b.effects = types.SimpleNamespace(release_lights=lambda ids: [])
         return b
 
     controller = {'name': 'Living Room ESP'}
@@ -69,6 +75,29 @@ class PairingTest(unittest.TestCase):
         again = b.pairing_status(self.controller)
         self.assertEqual(again['added'], [])
         self.assertEqual(b.changed, 1)
+
+    def test_removed_light_is_not_added_again(self):
+        b = self.make('off|3,a1b2c3d4e5f6,43169,ok;')
+        self.assertEqual(b.pairing_status(self.controller)['added'], [3])
+        b.remove_lights([3])
+        status = b.pairing_status(self.controller)
+        self.assertEqual(status['added'], [])
+        self.assertNotIn(3, b.lights)
+        self.assertEqual(status['lamps'], [])  # its entry is hidden too
+
+    def test_clear_hides_the_list_and_start_resets_it(self):
+        b = self.make('off|4,0011223344ff,43050,wait;')
+        b.clear_pairing(self.controller)
+        self.assertIn(('esphome', 'living_room_esp_clear_pairing', {}), b.ha.calls)
+        self.assertEqual(b.pairing_status(self.controller)['lamps'], [])
+        b.start_pairing(self.controller, 60)
+        self.assertEqual(len(b.pairing_status(self.controller)['lamps']), 1)
+
+    def test_start_skips_known_lamps(self):
+        b = self.make('off|')
+        b.lights[1]['did'] = 'A1B2C3D4E5F6'
+        b.start_pairing(self.controller, 60)
+        self.assertEqual(b.ha.calls[-1][2]['known_lamps'], 'a1b2c3d4e5f6')
 
     def test_non_light_device_is_not_added(self):
         b = self.make('off|5,a1b2c3d4e5f6,44181,ok;')  # a socket/relay

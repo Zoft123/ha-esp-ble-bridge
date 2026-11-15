@@ -92,7 +92,14 @@ Home Assistant ──ESPHome API──▶ ESP32 (ESPHome + FastCon) ──BLE ad
 
 **Pairing new lamps without the app:** in the **Pairing** tab, pick a controller, reset the lamps (as for the
 BRMesh app) and click **Start pairing**. Paired lamps are added to the light list; click **⚡ Install** on each
-controller afterwards. Lamps paired this way do not appear in the BRMesh app.
+controller afterwards. Lamps paired this way do not appear in the BRMesh app. Lamps already in the light list
+are skipped (firmware 2.2.0), and **Clear list** stops pairing and empties the controller's list.
+
+**Removing lights, or moving them back to the app:** remove a light from its card (⋯ → Remove), several with
+**Select…** on the Lights tab, or all of them under Settings → Danger zone. Like deleting a lamp in the BRMesh
+app, this sends nothing to the lamp: it keeps working until it is paired again, and can then be added in the
+BRMesh app (or on another phone) or paired here again. **Remove all lights** plus **Clear all pairing lists**
+start pairing over from scratch.
 
 When you add, rename or remove lights later, import a new export, pair them, or edit the lights in the add-on,
 then click **⚡ Install** on each controller again.

@@ -17,7 +17,7 @@ from state_store import ESPHOME_DIR
 
 log = getLogger(__name__)
 
-BRIDGE_FIRMWARE_VERSION = "2.1.0"
+BRIDGE_FIRMWARE_VERSION = "2.2.0"
 COMPONENTS_SRC = '/app/esphome_components'
 # Folder, inside /config/esphome, that the bundled ESPHome components are copied to.
 COMPONENTS_DIR_NAME = 'esp_ble_bridge_components'
@@ -98,11 +98,14 @@ class ESPHomeConfigGenerator:
         if controller.get('ip_address'):
             wifi['use_address'] = controller['ip_address']
         pairing_actions = [
+            # known_lamps: device IDs of lamps the add-on already has (they answer the discovery too).
             {'action': 'start_pairing',
-             'variables': {'light_ids': 'int[]', 'seconds': 'int'},
-             'then': [{'lambda': 'id(fastcon_controller).start_pairing(light_ids, seconds);'}]},
+             'variables': {'light_ids': 'int[]', 'seconds': 'int', 'known_lamps': 'string'},
+             'then': [{'lambda': 'id(fastcon_controller).start_pairing(light_ids, seconds, known_lamps);'}]},
             {'action': 'stop_pairing',
              'then': [{'lambda': 'id(fastcon_controller).stop_pairing();'}]},
+            {'action': 'clear_pairing',
+             'then': [{'lambda': 'id(fastcon_controller).clear_pairing();'}]},
         ]
         return {
             'esphome': {

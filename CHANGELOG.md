@@ -4,6 +4,24 @@ What changed in each version of ESP BLE Bridge, newest first. Versions follow [S
 Releases before 0.60.0 belong to the original project by Chris Valentino; their history is in
 [tofuweasel/ha-esp-ble-bridge](https://github.com/tofuweasel/ha-esp-ble-bridge).
 
+## [0.63.0] - 2026-11-15
+
+Controller firmware 2.2.0: install it on every controller (Controllers tab) after updating.
+
+### Added
+- **Remove several lights at once**: Lights → Select…, then Remove. Settings → Danger zone → **Remove all
+  lights** and **Clear all pairing lists** start pairing over. Removing a light works like deleting it in the
+  BRMesh app (which sends nothing to the lamp either): the lamp can then be added in the app, on another
+  phone, or paired here again.
+- **Clear list** on the Pairing tab stops pairing and empties the controller's list of found lamps.
+
+### Fixed
+- Lights removed after pairing came back whenever the Pairing tab was opened: the controller still listed
+  them as paired. Each confirmed lamp is now added once per pairing session.
+- Pairing skips lamps that are already in the light list (paired lamps answer the discovery request too);
+  before, a known lamp could be paired again under a new light ID.
+- Pairing packets still queued are no longer sent after pairing stops.
+
 ## [0.62.1] - 2026-10-28
 
 ### Fixed

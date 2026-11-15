@@ -3,6 +3,7 @@
 #include <array>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <esp_gap_ble_api.h>
 #include "esphome/core/component.h"
@@ -85,8 +86,13 @@ namespace esphome
             // lamp that replies with its new light ID and this controller's mesh key (encrypted with
             // the key the lamp sent), and wait for the lamp's heartbeat from that ID.
             // `light_ids` are the IDs the lamps may get, in order; the caller knows which are free.
-            void start_pairing(const std::vector<int32_t> &light_ids, int32_t seconds);
+            // `known_lamps` lists device IDs (12 hex digits, comma separated) of lamps the caller already
+            // has: paired lamps answer the discovery request too, and these are ignored.
+            void start_pairing(const std::vector<int32_t> &light_ids, int32_t seconds,
+                               const std::string &known_lamps = "");
             void stop_pairing();
+            // Stops pairing and forgets the lamps found, so the status sensor reads "off|".
+            void clear_pairing();
             bool is_pairing() const { return pairing_; }
             void set_pairing_sensor(text_sensor::TextSensor *sensor) { pairing_sensor_ = sensor; }
             // Called by esp32_ble for every advertisement heard while scanning.
@@ -165,9 +171,12 @@ namespace esphome
             void pairing_loop_(uint32_t now);
             void pairing_handle_frame_(const uint8_t *frame, size_t len, bool new_protocol);
             void pairing_set_scanning_(bool on);
+            // Removes the pairing packets (targets TARGET_PAIRING and up) from the scheduler.
+            void pairing_drop_packets_();
             void pairing_publish_();
             std::vector<PairingLamp> pairing_lamps_;
             std::deque<uint16_t> pairing_free_ids_;
+            std::vector<std::array<uint8_t, 6>> pairing_known_;
             text_sensor::TextSensor *pairing_sensor_{nullptr};
             bool pairing_{false};
             bool scanning_{false};

@@ -14,6 +14,10 @@
 //  4. The lamp joins the mesh and sends heartbeats (type 3, body encrypted with the mesh key,
 //     payload type 4) from its new light ID.
 //
+// Paired lamps answer the discovery request too: the app hides the ones already in its device list
+// (ScanDeviceActivity), and "deleting" a lamp in the app only removes it from that list. The caller
+// passes the device IDs it already has, and those lamps are ignored the same way.
+//
 // Lamps that answer in the "new protocol" frame (light IDs above 255, gateways) need the app's
 // 18 byte reply, which is not implemented; they are reported as unsupported.
 #include <algorithm>
@@ -36,9 +40,38 @@ static const size_t PAIRING_STATUS_MAX_LEN = 250;
 static const uint16_t TYPE_GATEWAY_NEW = 43756;
 static const uint8_t DEV_CTRL_UPLOAD_PREFIX[] = {0x6d, 0xb6, 0x43, 0x68, 0x93, 0x1d};
 
-void FastconController::start_pairing(const std::vector<int32_t> &light_ids, int32_t seconds) {
+// "a1b2c3d4e5f6,0011223344ff" -> device IDs; anything that is not 12 hex digits is skipped.
+static std::vector<std::array<uint8_t, 6>> parse_device_ids(const std::string &text) {
+  std::vector<std::array<uint8_t, 6>> out;
+  std::array<uint8_t, 6> did{};
+  size_t digits = 0;
+  bool valid = true;
+  for (size_t i = 0; i <= text.size(); i++) {
+    const char ch = i < text.size() ? text[i] : ',';
+    if (ch == ',' || ch == ';' || ch == ' ') {
+      if (valid && digits == 12)
+        out.push_back(did);
+      digits = 0;
+      valid = true;
+      did = {};
+      continue;
+    }
+    int v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+    if (v < 0 || digits >= 12) {
+      valid = false;
+      continue;
+    }
+    did[digits / 2] = static_cast<uint8_t>((did[digits / 2] << 4) | v);
+    digits++;
+  }
+  return out;
+}
+
+void FastconController::start_pairing(const std::vector<int32_t> &light_ids, int32_t seconds,
+                                      const std::string &known_lamps) {
   this->pairing_lamps_.clear();
   this->pairing_free_ids_.clear();
+  this->pairing_known_ = parse_device_ids(known_lamps);
   for (int32_t id : light_ids) {
     if (id >= 1 && id <= 255 &&
         std::find(this->pairing_free_ids_.begin(), this->pairing_free_ids_.end(), id) == this->pairing_free_ids_.end())
@@ -49,7 +82,8 @@ void FastconController::start_pairing(const std::vector<int32_t> &light_ids, int
   this->pairing_until_ = millis() + static_cast<uint32_t>(seconds) * 1000;
   this->pairing_last_send_ = millis() - PAIRING_SEND_INTERVAL_MS;
   this->pairing_set_scanning_(true);
-  ESP_LOGI(TAG, "Pairing for %d s, %u light IDs available", (int) seconds, (unsigned) this->pairing_free_ids_.size());
+  ESP_LOGI(TAG, "Pairing for %d s, %u light IDs available, %u known lamps skipped", (int) seconds,
+           (unsigned) this->pairing_free_ids_.size(), (unsigned) this->pairing_known_.size());
   this->pairing_dirty_ = true;
   this->pairing_publish_();
 }
@@ -59,11 +93,38 @@ void FastconController::stop_pairing() {
     return;
   this->pairing_ = false;
   this->pairing_set_scanning_(false);
+  this->pairing_drop_packets_();
   size_t paired = std::count_if(this->pairing_lamps_.begin(), this->pairing_lamps_.end(),
                                 [](const PairingLamp &l) { return l.state == PairingLamp::State::OK; });
   ESP_LOGI(TAG, "Pairing stopped, %u lamp(s) paired", (unsigned) paired);
   this->pairing_dirty_ = true;
   this->pairing_publish_();
+}
+
+void FastconController::clear_pairing() {
+  // Forget the lamps of the last session, so the status no longer lists them.
+  const bool was_pairing = this->pairing_;
+  this->pairing_ = false;
+  this->pairing_set_scanning_(false);
+  this->pairing_drop_packets_();
+  this->pairing_lamps_.clear();
+  this->pairing_free_ids_.clear();
+  this->pairing_known_.clear();
+  this->pairing_lamps_.shrink_to_fit();
+  this->pairing_known_.shrink_to_fit();
+  ESP_LOGI(TAG, "Pairing %scleared", was_pairing ? "stopped and " : "");
+  this->pairing_dirty_ = true;
+  this->pairing_publish_();
+}
+
+void FastconController::pairing_drop_packets_() {
+  // Discovery requests and replies still queued must not go out once pairing has ended.
+  std::lock_guard<std::mutex> lock(this->queue_mutex_);
+  this->slots_.erase(std::remove_if(this->slots_.begin(), this->slots_.end(),
+                                    [](const Slot &slot) { return slot.target >= TARGET_PAIRING; }),
+                     this->slots_.end());
+  if (this->next_slot_ >= this->slots_.size())
+    this->next_slot_ = 0;
 }
 
 void FastconController::pairing_set_scanning_(bool on) {
@@ -141,6 +202,8 @@ void FastconController::pairing_handle_frame_(const uint8_t *frame, size_t len, 
     std::copy(frame + 4, frame + 10, lamp.did.begin());
     lamp.type = frame[10] | (frame[11] << 8);
     std::copy(frame + 12, frame + 16, lamp.key.begin());
+    if (std::find(this->pairing_known_.begin(), this->pairing_known_.end(), lamp.did) != this->pairing_known_.end())
+      return;  // already one of the caller's lamps
     for (auto &known : this->pairing_lamps_) {
       if (known.did == lamp.did) {
         known.key = lamp.key;  // replies are encrypted with the latest key it announced
